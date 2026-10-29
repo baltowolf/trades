@@ -1,0 +1,239 @@
+{
+  "SBER": {
+    "name": "Сбербанк",
+    "sector": "Банки",
+    "listing_level": 1,
+    "net_debt_ebitda": 0.0,
+    "roe_pct": 24.5,
+    "fcf_positive": true,
+    "dividend_payer": true,
+    "moat": "Широкий (монопольное положение, IT-экосистема, дешевая ликвидность)",
+    "status": "EXCELLENT",
+    "red_flags": []
+  },
+  "LKOH": {
+    "name": "Лукойл",
+    "sector": "Нефть и газ",
+    "listing_level": 1,
+    "net_debt_ebitda": -0.2,
+    "roe_pct": 22.0,
+    "fcf_positive": true,
+    "dividend_payer": true,
+    "moat": "Широкий (высокая маржа переработки, отрицательный чистый долг)",
+    "status": "EXCELLENT",
+    "red_flags": []
+  },
+  "ROSN": {
+    "name": "Роснефть",
+    "sector": "Нефть и газ",
+    "listing_level": 1,
+    "net_debt_ebitda": 1.2,
+    "roe_pct": 16.0,
+    "fcf_positive": true,
+    "dividend_payer": true,
+    "moat": "Широкий (крупнейшие запасы, проект Восток Ойл, господдержка)",
+    "status": "GOOD",
+    "red_flags": []
+  },
+  "TATN": {
+    "name": "Татнефть",
+    "sector": "Нефть и газ",
+    "listing_level": 1,
+    "net_debt_ebitda": 0.1,
+    "roe_pct": 19.5,
+    "fcf_positive": true,
+    "dividend_payer": true,
+    "moat": "Широкий (чистый баланс, высокая глубина переработки ТАНЕКО)",
+    "status": "EXCELLENT",
+    "red_flags": []
+  },
+  "VTBR": {
+    "name": "Банк ВТБ",
+    "sector": "Банки",
+    "listing_level": 1,
+    "net_debt_ebitda": 0.0,
+    "roe_pct": 17.0,
+    "fcf_positive": true,
+    "dividend_payer": false,
+    "moat": "Средний (госбанк, но история размытия акционеров допэмиссиями)",
+    "status": "GOOD",
+    "red_flags": [
+      "Периодические риски допэмиссий и нестабильность дивидендов"
+    ]
+  },
+  "MTSS": {
+    "name": "МТС",
+    "sector": "Телеком",
+    "listing_level": 1,
+    "net_debt_ebitda": 1.9,
+    "roe_pct": 0.0,
+    "negative_equity": true,
+    "fcf_positive": true,
+    "dividend_payer": true,
+    "moat": "Средний (стабильная олигополия связи, но отрицательный капитал и долговой пресс)",
+    "status": "WARNING",
+    "red_flags": [
+      "Отрицательный собственный капитал по МСФО (математический ROE сломан)",
+      "Высокая чувствительность долга (~470 млрд ₽) к ставке ЦБ 20%+",
+      "Выплата 100%+ свободного кэша на дивиденды в долг материнской АФК Система"
+    ]
+  },
+  "HEAD": {
+    "name": "Хэдхантер",
+    "sector": "IT и Рекрутинг",
+    "listing_level": 1,
+    "net_debt_ebitda": -0.8,
+    "roe_pct": 65.0,
+    "fcf_positive": true,
+    "dividend_payer": true,
+    "moat": "Широкий (абсолютная монополия на рынке найма в РФ, asset-light бизнес)",
+    "status": "EXCELLENT",
+    "red_flags": []
+  },
+  "YDEX": {
+    "name": "Яндекс",
+    "sector": "IT и Технологии",
+    "listing_level": 1,
+    "net_debt_ebitda": -0.3,
+    "roe_pct": 21.0,
+    "fcf_positive": true,
+    "dividend_payer": true,
+    "moat": "Широкий (абсолютный лидер в поиске, такси и цифровой рекламе РФ)",
+    "status": "EXCELLENT",
+    "red_flags": []
+  },
+  "PLZL": {
+    "name": "Полюс",
+    "sector": "Золотодобыча",
+    "listing_level": 1,
+    "net_debt_ebitda": 0.7,
+    "roe_pct": 32.0,
+    "fcf_positive": true,
+    "dividend_payer": true,
+    "moat": "Широкий (самая низкая в мире себестоимость добычи унции золота)",
+    "status": "EXCELLENT",
+    "red_flags": []
+  },
+  "SNGSP": {
+    "name": "Сургутнефтегаз прив.",
+    "sector": "Нефть и газ",
+    "listing_level": 1,
+    "net_debt_ebitda": -5.0,
+    "roe_pct": 15.0,
+    "fcf_positive": true,
+    "dividend_payer": true,
+    "moat": "Широкий (гигантская валютная подушка ликвидности > 5 трлн ₽)",
+    "status": "GOOD",
+    "red_flags": []
+  },
+  "T": {
+    "name": "Т-Технологии (ТКС)",
+    "sector": "Финтех / Банки",
+    "listing_level": 1,
+    "net_debt_ebitda": 0.0,
+    "roe_pct": 30.5,
+    "fcf_positive": true,
+    "dividend_payer": true,
+    "moat": "Широкий (высочайший ROE в секторе, лояльная база клиентов, интеграция Росбанка)",
+    "status": "EXCELLENT",
+    "red_flags": []
+  },
+  "GMKN": {
+    "name": "Норникель",
+    "sector": "Металлы и добыча",
+    "listing_level": 1,
+    "net_debt_ebitda": 1.6,
+    "roe_pct": 18.0,
+    "fcf_positive": true,
+    "dividend_payer": false,
+    "moat": "Широкий (глобальный лидер по палладию и никелю высшего сорта)",
+    "status": "GOOD",
+    "red_flags": [
+      "Временная пауза в дивидендах из-за капекса и перестройки логистики"
+    ]
+  },
+  "GAZP": {
+    "name": "Газпром",
+    "sector": "Нефть и газ",
+    "listing_level": 1,
+    "net_debt_ebitda": 2.8,
+    "roe_pct": 4.5,
+    "fcf_positive": false,
+    "dividend_payer": false,
+    "moat": "Узкий (утрата европейского рынка экспорта, колоссальный капекс на Восток)",
+    "status": "WARNING",
+    "red_flags": [
+      "Чистый долг / EBITDA приблизился к 3.0x",
+      "Дивиденды не выплачиваются",
+      "Потеря ключевого премиального экспортного рынка ЕС"
+    ]
+  },
+  "CHMF": {
+    "name": "Северсталь",
+    "sector": "Черная металлургия",
+    "listing_level": 1,
+    "net_debt_ebitda": -0.1,
+    "roe_pct": 7.5,
+    "fcf_positive": false,
+    "dividend_payer": true,
+    "moat": "Средний (циклический бизнес, себестоимость низкая, но ценообразование не контролирует)",
+    "status": "WARNING",
+    "red_flags": [
+      "Спад спроса на сталь в строительном секторе из-за ставки ЦБ 20%+",
+      "Пик масштабной капексной программы сжал свободный денежный поток (FCF)",
+      "Рост фискальной нагрузки: акциз на жидкую сталь и налог на прибыль 25%"
+    ]
+  },
+  "MOEX": {
+    "name": "Московская Биржа",
+    "sector": "Финансовая инфраструктура",
+    "listing_level": 1,
+    "net_debt_ebitda": -1.0,
+    "roe_pct": 27.0,
+    "fcf_positive": true,
+    "dividend_payer": true,
+    "moat": "Широкий (абсолютная монополия на биржевые торги в РФ, бенефициар высокой ставки)",
+    "status": "EXCELLENT",
+    "red_flags": []
+  },
+  "IRAO": {
+    "name": "Интер РАО",
+    "sector": "Электроэнергетика",
+    "listing_level": 1,
+    "net_debt_ebitda": -2.0,
+    "roe_pct": 14.5,
+    "fcf_positive": true,
+    "dividend_payer": true,
+    "moat": "Широкий (огромная чистая денежная позиция > 350 млрд ₽, проценты по депозитам)",
+    "status": "EXCELLENT",
+    "red_flags": []
+  },
+  "OZON": {
+    "name": "Озон",
+    "sector": "E-commerce",
+    "listing_level": 1,
+    "net_debt_ebitda": 0.5,
+    "roe_pct": 18.0,
+    "fcf_positive": true,
+    "dividend_payer": false,
+    "moat": "Широкий (рост оборота GMV > 60%, масштабная сеть ПВЗ)",
+    "status": "GOOD",
+    "red_flags": []
+  },
+  "MTLR": {
+    "name": "Мечел",
+    "sector": "Уголь и сталь",
+    "listing_level": 1,
+    "net_debt_ebitda": 4.5,
+    "roe_pct": -15.0,
+    "fcf_positive": false,
+    "dividend_payer": false,
+    "moat": "Отсутствует (критический долг, процентные расходы сжирают операционную прибыль)",
+    "status": "BAD",
+    "red_flags": [
+      "Чистый долг / EBITDA > 4.5x (критический уровень дефолта)",
+      "Чистый убыток, отрицательный ROE",
+      "Отрицательный FCF"
+    ]
+  }
+}

@@ -1,0 +1,28 @@
+# Credentials & secrets
+.env
+*.key
+*.pem
+
+# Runtime dynamic state & notifications logs
+state.json
+notifications.json
+*.tmp
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# IDE & Editor files
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
