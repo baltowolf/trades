@@ -23,6 +23,9 @@ env/
 *.swp
 *.swo
 
+# Local agent/MCP configuration
+.roo/mcp.json
+
 # OS files
 .DS_Store
 Thumbs.db
