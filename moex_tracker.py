@@ -37,7 +37,7 @@ MOEX Stock Tracker v5.0 — sell-only трекер.
     python moex_tracker.py --migrate       — backup и сброс state
     python moex_tracker.py --reset-plan TICKER — пересчитать план от текущей цены
 
-fundamentals.json и ideas.json больше не используются.
+fundamentals.json и ideas.json удалены из проекта.
 state.json требует schema_version: 4.
 """
 
@@ -1557,7 +1557,7 @@ def run_migration() -> None:
     print(f"✓ state.json сброшен"
           f"{' (backup: ' + backup_state + ')' if backup_state else ''}")
 
-    print("\nfundamentals.json и ideas.json больше не используются.")
+    print("\nfundamentals.json и ideas.json удалены из проекта.")
     print("Достаточно portfolio.json: count, buy_price, необязательный target.")
     print("=" * 78 + "\n")
 
@@ -1827,7 +1827,7 @@ def main() -> None:
     if "--screen" in argv or "--ideas-check" in argv:
         print_header()
         print("Команда удалена: скрипт теперь sell-only. "
-              "Заполнять fundamentals.json и ideas.json не нужно.")
+              "fundamentals.json и ideas.json удалены из проекта.")
         return
 
     print_header()

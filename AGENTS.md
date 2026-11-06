@@ -39,7 +39,7 @@ Input `portfolio.json`:
 - `python moex_tracker.py --reset-plan TICKER` — recompute a plan from the current price
 - `python test_fixes.py` — regression and sanity tests
 
-`--screen` and `--ideas-check` are intentionally removed. `fundamentals.json` and `ideas.json` are not read.
+`--screen` and `--ideas-check` are intentionally removed. `fundamentals.json` and `ideas.json` were removed from the project.
 
 ## Critical Patterns
 
