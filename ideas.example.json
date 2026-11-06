@@ -1,0 +1,27 @@
+{
+  "_meta": {
+    "schema_version": 1,
+    "updated": "2026-11-06",
+    "readme": "ШАБЛОН. Скопируйте актуальные идеи ВТБ в ideas.json. Даты YYYY-MM-DD, цены в рублях, горизонт не более 180 дней. Поля _meta и _readme загрузчик игнорирует."
+  },
+  "SBER": {
+    "name": "Сбербанк",
+    "sector": "Банки",
+    "source": "VTB My Investments",
+    "published": "2026-11-01",
+    "valid_until": "2027-04-30",
+    "entry_low": 280.0,
+    "entry_high": 300.0,
+    "target": 380.0,
+    "stop": 260.0,
+    "conviction": 4,
+    "active": true,
+    "thesis": "ПРИМЕР. Замените на актуальную идею ВТБ и обновите даты, цены и тезис.",
+    "target_history": [
+      {
+        "date": "2026-11-01",
+        "target": 380.0
+      }
+    ]
+  }
+}

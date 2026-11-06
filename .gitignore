@@ -7,6 +7,7 @@
 state.json
 notifications.json
 *.tmp
+*.v3.bak
 
 # Python artifacts
 __pycache__/

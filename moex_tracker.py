@@ -1,32 +1,42 @@
 """
-MOEX Stock Tracker v3.6 — ATR + золото + журнал + pre-TP1 защита + Wilder RSI.
+MOEX Stock Tracker v4.0 — спекулятивный портфель на идеях ВТБ Инвестиций.
 
-Изменения относительно v3.5:
-  • Pre-TP1 защита стопа: порог поднят до buy + 2.0 ATR (при TP1 = 2.5 ATR),
-    стоп поднимается в buy + 0.5 ATR.
-  • TP1 поднят до 2.5 ATR для соблюдения Risk/Reward >= 1.0 (при стопе 2.5 ATR).
-  • Расчёт RSI переведён на сглаживание Уайлдера (Wilder's smoothing).
-  • Учёт дневного максимума (HIGH) в трекинге пика позиции.
+Ключевые изменения относительно v3.6:
+  • Ядро исключено: все акции торгуемые, стоп/последняя ступень закрывают всю позицию.
+  • Новые покупки — только по активным идеям из ideas.json (ВТБ Инвестиции).
+  • Горизонт идеи ограничен valid_until; после него позиция закрывается.
+  • Динамический ладдер по R и цели ВТБ; последняя ступень продаёт весь остаток.
+  • Cost-aware безубыток: комиссии, slippage и НДФЛ учитываются в R и ожидании.
+  • Риск-движок: fixed-fractional, half-Kelly, heat, sector, correlation, vol targeting.
+  • Скринер недооценённых компаний (value + quality + growth + momentum + risk)
+    вместо субъективного фундаментального аудита.
+  • Fail-closed: повреждённые входные файлы не приводят к покупкам «с нуля».
 
 Команды:
-    python moex_tracker.py                 — обычный запуск
-    python moex_tracker.py --send-pending  — дослать накопленное в Telegram
-    python moex_tracker.py --show          — показать последние уведомления
-    python moex_tracker.py --audit-buffett — аудит качества бизнеса по Баффету
+    python moex_tracker.py                 — основной цикл
+    python moex_tracker.py --show          — последние уведомления
+    python moex_tracker.py --send-pending  — дослать неотправленное в Telegram
+    python moex_tracker.py --screen        — количественный скрининг
+    python moex_tracker.py --ideas-check   — валидация ideas.json и fundamentals.json
+    python moex_tracker.py --stats         — paper-статистика сделок
+    python moex_tracker.py --migrate       — миграция v3 → v4 с backup
+    python moex_tracker.py --reset-plan TICKER — пересчитать план от текущей цены
 
-ВАЖНО: state.json совместим с v3.4. Если обновляешься с v3.0 или раньше —
-удали state.json.
+ВАЖНО: state.json v3 несовместим с v4. Перед первым запуском выполните
+`python moex_tracker.py --migrate`.
 """
 
+import html
 import json
+import math
 import os
+import shutil
 import statistics
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-import html
-from datetime import datetime, time as dtime, timedelta, timezone
-from typing import Dict, List, Optional, Tuple
+from datetime import date, datetime, time as dtime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -45,7 +55,10 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 # КОНФИГУРАЦИЯ
 # ==============================================================================
 
-# ponytail: простой парсер .env без сторонних библиотек (python-dotenv не нужен)
+VERSION = "4.0.0"
+STATE_SCHEMA_VERSION = 4
+
+# ponytail: простой парсер .env без сторонних библиотек
 if os.path.exists(".env"):
     with open(".env", "r", encoding="utf-8") as f:
         for line in f:
@@ -55,161 +68,266 @@ if os.path.exists(".env"):
                 os.environ.setdefault(k.strip(), v.strip())
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID",   "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# --- АКЦИИ: ATR-логика ---
-TAKE_PROFIT_ATR_LEVELS = [
-    {"atr_mult": 2.5, "sell_pct": 0.25},
-    {"atr_mult": 4.0, "sell_pct": 0.30},
-    {"atr_mult": 6.0, "sell_pct": 0.35},
-]
-INITIAL_STOP_ATR       = 2.5
-BREAKEVEN_PLUS_ATR     = 0.5      # после TP1: стоп = buy + 0.5 ATR
-TRAILING_ATR_MULT      = 3.0
-TRAILING_LOOKBACK_DAYS = 22
+# --- Файлы ---
+PORTFOLIO_FILE = "portfolio.json"
+IDEAS_FILE = "ideas.json"
+IDEAS_EXAMPLE_FILE = "ideas.example.json"
+FUNDAMENTALS_FILE = "fundamentals.json"
+STATE_FILE = "state.json"
+NOTIFICATIONS_FILE = "notifications.json"
 
-# --- Pre-TP1 защита прибыли ---
-# Если цена дошла до buy + 2.0 ATR, но TP1 (2.5 ATR) ещё не сработал,
-# поднимаем стоп в buy + 0.5 ATR. Защищает от «развернулось у порога TP1».
-PRE_TP1_PROTECT_ATR      = 2.0
-PRE_TP1_PROTECT_PLUS_ATR = 0.5
+MAX_NOTIFICATIONS_KEPT = 500
+RECENT_NOTIFICATIONS_SHOWN = 10
+MAX_TRADE_LOG = 500
 
-# --- ЗОЛОТО ---
-GOLD_TICKERS = {"GOLD", "SBGD", "AKGD", "TGLD", "BCSG"}
-GOLD_MA_PERIOD          = 200
-GOLD_RSI_ENTRY          = 38.0
-GOLD_RSI_FLOOR          = 20.0
-GOLD_STOP_ATR           = 3.0
-GOLD_BREAKEVEN_PLUS_ATR = 0.5
-GOLD_TRAILING_ATR       = 4.0
-GOLD_MAX_POSITION_PCT   = 0.15
-GOLD_TAKE_PROFIT_LEVELS = [
-    {"atr_mult": 2.5, "sell_pct": 0.30},
-    {"atr_mult": 4.5, "sell_pct": 0.30},
-    {"atr_mult": 7.0, "sell_pct": 0.40},
-]
+# --- Горизонт идей ---
+MAX_TRADING_HORIZON_DAYS = 180
+TIME_EXIT_GRACE_DAYS = 5
+MAX_LEGACY_HOLDING_DAYS = 90
+
+# --- Математическое ожидание ---
+MIN_RR = 2.0
+MIN_UPSIDE_PCT = 10.0
+MAX_STOP_DISTANCE_PCT = 18.0
+MIN_EXPECTANCY_R = 0.05
+PRIOR_WINS = 4
+PRIOR_LOSSES = 6
+P_WIN_MIN = 0.30
+P_WIN_MAX = 0.55
+
+# --- Стопы и ладдер ---
+INITIAL_STOP_ATR = 3.0
+TRAILING_ATR_MULT = 3.0
+PRE_TP1_TRIGGER_R = 0.75
+PRE_TP1_LOCK_R = 0.25
+TP1_R = 1.0
+TP2_R = 2.0
+TP1_SELL_PCT_3 = 0.40
+TP2_SELL_PCT_3 = 0.30
+TP1_SELL_PCT_2 = 0.50
 
 # --- Риск-менеджмент ---
-RISK_PER_TRADE_PCT = 0.015
-MAX_POSITION_PCT   = 0.25
+RISK_PER_TRADE_PCT = 0.0075
+MAX_POSITION_PCT = 0.15
+MAX_PORTFOLIO_HEAT_PCT = 0.05
+MAX_SECTOR_PCT = 0.30
+MAX_POSITIONS = 10
+MAX_ADV_PCT = 0.01
+MIN_CASH_PCT = 0.10
+MAX_PORTFOLIO_VOL_PCT = 0.25
+CORR_CLUSTER_THRESHOLD = 0.75
+MAX_CLUSTER_PCT = 0.30
+PORTFOLIO_DD_HALT_PCT = 0.10
+MAX_DAILY_LOSS_PCT = 0.03
+KELLY_FRACTION = 0.5
 
-# --- Индикаторы ---
-ATR_WINDOW_DAYS  = 14
-SMA_WINDOW_DAYS  = 20
-RSI_WINDOW_DAYS  = 14
-TREND_EMA_PERIOD = 50
-
-# --- Вход для акций (эмпирический откат в тренде) ---
-BUY_Z_THRESHOLD   = -1.2
-BUY_RSI_THRESHOLD = 38.0
-BUY_DAY_DROP_PCT  = 1.8
+# --- Скринер ---
+WEIGHT_VALUE = 0.30
+WEIGHT_QUALITY = 0.20
+WEIGHT_GROWTH = 0.10
+WEIGHT_MOMENTUM = 0.20
+WEIGHT_RISK = 0.10
+WEIGHT_IDEA = 0.10
+ZSCORE_CLIP = 3.0
+MIN_SCREEN_TICKERS = 5
+MIN_SECTOR_NAMES = 3
+FUNDAMENTALS_WARN_DAYS = 120
+FUNDAMENTALS_HARD_STALE_DAYS = 180
 
 # --- Издержки ---
 COMMISSION_PCT = 0.1
-TAX_PCT        = 13.0
-INCLUDE_TAX    = True
+TAX_PCT = 13.0
+SLIPPAGE_PCT = 0.05
+INCLUDE_TAX = True
 
-# --- Ликвидность ---
-TOP_N_LIQUID     = 50
+# --- Ликвидность и данные ---
 MIN_DAILY_VOLUME = 30_000_000
+TOP_N_LIQUID = 50
+CANDLES_DAYS_STOCKS = 300
+CANDLES_DAYS_GOLD = 400
+CANDLES_DAYS_INDEX = 300
+CANDLES_CACHE_TTL = 1800
+ATR_WINDOW_DAYS = 14
+RSI_WINDOW_DAYS = 14
+TREND_EMA_PERIOD = 50
+TRAILING_LOOKBACK_DAYS = 22
+MAX_ATR_PCT = 8.0
+BUY_RSI_MAX = 65.0
+BUY_Z_MAX = 1.5
 
 # --- Технические ---
 CHECK_INTERVAL_SECONDS = 600
-RETRY_DELAY_SECONDS    = 30
-MOEX_CONNECT_TIMEOUT   = 10
-MOEX_READ_TIMEOUT      = 25
-MOEX_MAX_RETRIES       = 3
-CANDLES_CACHE_TTL      = 1800
+RETRY_DELAY_SECONDS = 30
+MOEX_CONNECT_TIMEOUT = 10
+MOEX_READ_TIMEOUT = 25
+MOEX_MAX_RETRIES = 3
 
-PORTFOLIO_FILE     = "portfolio.json"
-STATE_FILE         = "state.json"
-NOTIFICATIONS_FILE = "notifications.json"
-FUNDAMENTALS_FILE  = "fundamentals.json"
-MAX_NOTIFICATIONS_KEPT     = 500
-RECENT_NOTIFICATIONS_SHOWN = 10
+# --- Золото: только legacy до выхода, новых покупок нет ---
+GOLD_TICKERS = {"GOLD", "SBGD", "AKGD", "TGLD", "BCSG"}
 
-# --- Баффет-контроль качества бизнеса ---
-BUFFETT_AUDIT_INTERVAL_DAYS   = 7      # аудит раз в неделю
-MAX_DEBT_EBITDA_THRESHOLD     = 3.0    # долговой предел при ставке 20%+
-MIN_ROE_THRESHOLD             = 10.0   # порог отдачи на капитал
-SMA200_STRUCTURAL_DROP_PCT    = 25.0   # порог затяжного рыночного спада
-
-MSK_TZ        = timezone(timedelta(hours=3))
+MSK_TZ = timezone(timedelta(hours=3))
 SESSION_START = dtime(10, 0)
-SESSION_END   = dtime(23, 50)
+SESSION_END = dtime(23, 50)
 
-_candles_cache: Dict[str, Tuple[float, list]] = {}
+SECTOR_ALIASES = {
+    "IT и Технологии": "IT",
+    "IT и Рекрутинг": "IT",
+    "IT": "IT",
+    "Финтех / Банки": "Банки",
+    "Банки": "Банки",
+    "Финансовая инфраструктура": "Финансы",
+    "Финансы": "Финансы",
+    "Нефть и газ": "Нефть и газ",
+    "Металлы и добыча": "Металлы",
+    "Черная металлургия": "Металлы",
+    "Уголь и сталь": "Металлы",
+    "Металлы": "Металлы",
+    "Золотодобыча": "Золотодобыча",
+    "Электроэнергетика": "Электроэнергетика",
+    "E-commerce": "Ритейл",
+    "Ритейл": "Ритейл",
+    "Телеком": "Телеком",
+    "Химия/удобрения": "Химия",
+    "Химия": "Химия",
+    "Недвижимость": "Недвижимость",
+    "Транспорт": "Транспорт",
+    "Прочее": "Прочее",
+}
+
+_candles_cache: Dict[str, Tuple[float, int, list]] = {}
+_index_candles_cache: Optional[Tuple[float, list]] = None
 
 
 # ==============================================================================
-# 1. СОСТОЯНИЕ
+# 1. АТОМАРНЫЙ I/O
 # ==============================================================================
 
-def load_state() -> dict:
-    default = {
-        "positions": {},
-        "notified_date": "",
-        "notified_profit": [],
-        "notified_buy": [],
-        "notified_stop": [],
-        "notified_buffett": [],
-        "last_buffett_audit": "",
-    }
-    if not os.path.exists(STATE_FILE):
-        return default
+def atomic_write_json(path: str, data: Any) -> None:
+    """Атомарная запись JSON: tmp + fsync + os.replace."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _load_json_file(path: str) -> Tuple[Any, Optional[str]]:
+    if not os.path.exists(path):
+        return None, f"файл {path} не найден"
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        for k, v in default.items():
-            data.setdefault(k, v)
-        return data
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f), None
     except Exception as e:
-        print(f"[ПРЕДУПРЕЖДЕНИЕ] Не удалось прочитать {STATE_FILE}: {e}")
-        return default
+        return None, f"не удалось прочитать {path}: {e}"
+
+
+def _parse_iso_date(value: Any) -> Optional[date]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return datetime.strptime(value.strip()[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def normalize_sector(value: Any) -> str:
+    raw = str(value or "").strip()
+    return SECTOR_ALIASES.get(raw, raw or "Прочее")
+
+
+# ==============================================================================
+# 2. СОСТОЯНИЕ
+# ==============================================================================
+
+def default_state() -> dict:
+    return {
+        "schema_version": STATE_SCHEMA_VERSION,
+        "positions": {},
+        "closed_trades": [],
+        "stats": {"wins": 0, "losses": 0, "gross_profit": 0.0, "gross_loss": 0.0},
+        "equity_peak": 0.0,
+        "day_start_equity": 0.0,
+        "day_date": "",
+        "halt_new_entries_until": "",
+        "notified_date": "",
+        "notified_buy": [],
+        "notified_profit": [],
+        "notified_stop": [],
+        "pending_entries": {},
+        "last_screen": {},
+    }
+
+
+def load_state() -> Tuple[dict, Optional[str]]:
+    """Fail-closed: при повреждённом/старом state возвращает ошибку."""
+    if not os.path.exists(STATE_FILE):
+        return default_state(), None
+    raw, err = _load_json_file(STATE_FILE)
+    if err:
+        return default_state(), err
+    if not isinstance(raw, dict):
+        return default_state(), "state.json: корневой элемент не объект"
+    if raw.get("schema_version") != STATE_SCHEMA_VERSION:
+        return default_state(), (
+            "state.json: схема не v4. Выполните `python moex_tracker.py --migrate`"
+        )
+    state = default_state()
+    for key, value in raw.items():
+        state[key] = value
+    if not isinstance(state.get("positions"), dict):
+        return default_state(), "state.json: positions повреждён"
+    if not isinstance(state.get("stats"), dict):
+        state["stats"] = {"wins": 0, "losses": 0, "gross_profit": 0.0, "gross_loss": 0.0}
+    if not isinstance(state.get("closed_trades"), list):
+        state["closed_trades"] = []
+    if not isinstance(state.get("pending_entries"), dict):
+        state["pending_entries"] = {}
+    for key in ("notified_buy", "notified_profit", "notified_stop"):
+        if not isinstance(state.get(key), list):
+            state[key] = []
+    return state, None
 
 
 def save_state(state: dict) -> None:
-    tmp = STATE_FILE + ".tmp"
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, STATE_FILE)
+        atomic_write_json(STATE_FILE, state)
     except Exception as e:
         print(f"[ОШИБКА] Не удалось сохранить состояние: {e}")
+        raise
+
+
+def _purge_pending_entries(state: dict, today_str: str) -> None:
+    pending = state.get("pending_entries", {})
+    for ticker in list(pending.keys()):
+        if pending[ticker].get("date") != today_str:
+            del pending[ticker]
 
 
 # ==============================================================================
-# 2. ЖУРНАЛ УВЕДОМЛЕНИЙ
+# 3. ЖУРНАЛ УВЕДОМЛЕНИЙ
 # ==============================================================================
 
 def load_notifications() -> list:
-    if not os.path.exists(NOTIFICATIONS_FILE):
+    raw, err = _load_json_file(NOTIFICATIONS_FILE)
+    if err:
+        if os.path.exists(NOTIFICATIONS_FILE):
+            print(f"[ПРЕДУПРЕЖДЕНИЕ] {err}")
         return []
-    try:
-        with open(NOTIFICATIONS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, list) else []
-    except Exception as e:
-        print(f"[ПРЕДУПРЕЖДЕНИЕ] Не удалось прочитать {NOTIFICATIONS_FILE}: {e}")
-        return []
+    return raw if isinstance(raw, list) else []
 
 
 def save_notifications(notifs: list) -> None:
-    tmp = NOTIFICATIONS_FILE + ".tmp"
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(notifs, f, ensure_ascii=False, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, NOTIFICATIONS_FILE)
+        atomic_write_json(NOTIFICATIONS_FILE, notifs)
     except Exception as e:
         print(f"[ОШИБКА] Не удалось сохранить {NOTIFICATIONS_FILE}: {e}")
 
 
 def _strip_html(text: str) -> str:
-    return text.replace("<b>", "").replace("</b>", "")
+    return text.replace("<b>", "").replace("</b>", "").replace("<i>", "").replace("</i>", "")
 
 
 def is_test_mode() -> bool:
@@ -224,6 +342,25 @@ def notification_exists(key: str, date_str: str, notifs: Optional[list] = None) 
         if n.get("key") == key and n.get("date") == date_str:
             return True
     return False
+
+
+def send_telegram_message(html_text: str) -> bool:
+    if is_test_mode():
+        print(f"\n[TELEGRAM ТЕСТ — токен не задан]\n{_strip_html(html_text)}\n"
+              + "-" * 60)
+        return True
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": html_text, "parse_mode": "HTML"}
+    try:
+        r = requests.post(url, json=payload, timeout=10)
+        r.raise_for_status()
+        return True
+    except requests.RequestException as e:
+        err_msg = str(e)
+        if hasattr(e, "response") and e.response is not None:
+            err_msg += f" | {e.response.text}"
+        print(f"[ОШИБКА TELEGRAM] {err_msg}")
+        return False
 
 
 def dispatch_notification(key: str, kind: str, ticker: str, message: str) -> bool:
@@ -288,7 +425,7 @@ def send_pending_notifications() -> None:
         print(f"[PENDING] Нет неотправленных за {today}.")
         return
     if is_test_mode():
-        print(f"[PENDING] Telegram не настроен. Уведомления только в файле.")
+        print("[PENDING] Telegram не настроен. Уведомления только в файле.")
         return
 
     print(f"[PENDING] Найдено {len(pending)} неотправленных за {today}.")
@@ -314,7 +451,6 @@ def try_send_pending_silent() -> None:
                if n.get("date") == today and not n.get("telegram_sent")]
     if not pending:
         return
-
     print(f"[STARTUP] Найдено {len(pending)} неотправленных за сегодня. Пробую...")
     sent = 0
     for n in pending:
@@ -329,186 +465,263 @@ def try_send_pending_silent() -> None:
 
 
 # ==============================================================================
-# 3. ПОРТФЕЛЬ
+# 4. ПОРТФЕЛЬ
 # ==============================================================================
 
-def load_portfolio(filepath: str) -> Tuple[Dict[str, dict], float]:
-    if not os.path.exists(filepath):
-        print(f"[ВНИМАНИЕ] Файл портфеля '{filepath}' не найден.")
-        return {}, 0.0
+def load_portfolio(filepath: str = PORTFOLIO_FILE) -> Tuple[Dict[str, dict], float, Optional[str]]:
+    """Fail-closed: любая ошибка структуры возвращает текст ошибки."""
+    raw, err = _load_json_file(filepath)
+    if err:
+        return {}, 0.0, err
+    if not isinstance(raw, dict):
+        return {}, 0.0, f"{filepath}: корневой элемент не объект"
     try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        cash = float(raw.get("CASH", 0.0))
-        positions = {}
-        for key, value in raw.items():
-            if key.upper() == "CASH":
-                continue
-            if isinstance(value, dict) and "count" in value and "buy_price" in value:
-                positions[key.upper()] = {
-                    "count": int(value["count"]),
-                    "buy_price": float(value["buy_price"]),
-                    "core_count": int(value.get("core_count", 0)),
-                }
-            else:
-                print(f"[ПРЕДУПРЕЖДЕНИЕ] Некорректная позиция {key}: {value}")
-        return positions, cash
-    except Exception as e:
-        print(f"[ОШИБКА] Не удалось прочитать '{filepath}': {e}")
-        return {}, 0.0
-
-
-# ==============================================================================
-# 3.1. БАФФЕТ-ФУНДАМЕНТАЛ
-# ==============================================================================
-
-def load_fundamentals() -> dict:
-    if not os.path.exists(FUNDAMENTALS_FILE):
-        return {}
-    try:
-        with open(FUNDAMENTALS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        print(f"[ПРЕДУПРЕЖДЕНИЕ] Не удалось прочитать {FUNDAMENTALS_FILE}: {e}")
-        return {}
-
-
-def evaluate_buffett_health(ticker: str, pos: dict, stock: Optional[dict],
-                            fund_map: dict) -> Tuple[str, List[str]]:
-    """
-    Проверяет бизнес компании по фундаментальным и рыночным критериям Баффета.
-    """
-    if ticker in GOLD_TICKERS:
-        return "EXCELLENT", []
-
-    fund = fund_map.get(ticker)
-    reasons = []
-
-    if fund:
-        status = fund.get("status", "GOOD")
-        net_debt = fund.get("net_debt_ebitda", 0.0)
-        roe = fund.get("roe_pct", 15.0)
-        fcf = fund.get("fcf_positive", True)
-        flags = fund.get("red_flags", [])
-
-        if status == "BAD":
-            reasons.append(f"Критический статус: {fund.get('moat', 'бизнес разрушает стоимость')}")
-
-        if fund.get("negative_equity", False):
-            reasons.append("Отрицательный собственный капитал по МСФО (модель держится на долге)")
-
-        if net_debt > MAX_DEBT_EBITDA_THRESHOLD:
-            reasons.append(f"Чрезмерный долг: Чистый долг / EBITDA = {net_debt:.1f}x (выше {MAX_DEBT_EBITDA_THRESHOLD}x)")
-
-        if not fund.get("negative_equity", False) and roe < MIN_ROE_THRESHOLD and fund.get("sector") != "Золотодобыча":
-            reasons.append(f"Слабая отдача на капитал: ROE = {roe:.1f}% (ниже {MIN_ROE_THRESHOLD}%)")
-
-        if not fcf:
-            reasons.append("Отрицательный свободный денежный поток (FCF)")
-
-        for fl in flags:
-            reasons.append(fl)
-    else:
-        status = "UNKNOWN"
-
-    # Биржевые критерии (ликвидность и затяжной тренд ниже SMA200)
-    if stock:
-        vol = stock.get("volume", 0.0)
-        if vol > 0 and vol < MIN_DAILY_VOLUME:
-            reasons.append(f"Падение ликвидности: оборот {vol:,.0f} ₽ < {MIN_DAILY_VOLUME:,.0f} ₽")
-
-        sma200 = stock.get("sma200")
-        last = stock.get("last", 0.0)
-        if sma200 and last > 0:
-            drop_from_sma = (sma200 - last) / sma200 * 100.0
-            if drop_from_sma >= SMA200_STRUCTURAL_DROP_PCT:
-                reasons.append(f"Структурный спад: цена {last:.2f} ₽ на {drop_from_sma:.1f}% ниже SMA200 ({sma200:.2f} ₽)")
-
-    # Дедупликация причин
-    reasons = list(dict.fromkeys(reasons))
-
-    is_bad = (
-        status == "BAD"
-        or any("Критический" in r or "Чрезмерный долг" in r for r in reasons)
-        or len(reasons) >= 3
-    )
-    final_status = "BAD" if is_bad else ("WARNING" if reasons else "GOOD")
-    return final_status, reasons
-
-
-def format_buffett_warning_message(ticker: str, status: str, reasons: List[str],
-                                   fund_map: dict) -> str:
-    fund = fund_map.get(ticker, {})
-    name = fund.get("name", ticker)
-    sector = fund.get("sector", "Рынок РФ")
-    moat = fund.get("moat", "Не определён")
-    # Экранирование спецсимволов HTML для Telegram
-    reasons_fmt = "\n".join(f"• {html.escape(r)}" for r in reasons)
-
-    # Динамический подбор первоклассных альтернатив без текущего тикера
-    best_candidates = [
-        t for t, f in fund_map.items()
-        if t != ticker and f.get("status") == "EXCELLENT" and f.get("net_debt_ebitda", 0.0) <= 0.0
-    ]
-    if not best_candidates:
-        best_candidates = [t for t, f in fund_map.items() if t != ticker and f.get("status") in ("EXCELLENT", "GOOD")]
-    alt_str = ", ".join(best_candidates[:4]) if best_candidates else "SBER, LKOH, MOEX, HEAD"
-
-    return (
-        f"🚨 <b>БАФФЕТ-КОНТРОЛЬ: УХУДШЕНИЕ БИЗНЕСА — {ticker} ({name})</b>\n"
-        f"Сектор: {sector} | Оценка: <b>{status}</b>\n"
-        f"Экономический ров (Moat): {moat}\n\n"
-        f"<b>Причины ухудшения:</b>\n"
-        f"{reasons_fmt}\n\n"
-        f"💼 <b>Рекомендация Баффета:</b> рассмотреть закрытие позиции "
-        f"и перекладку в первоклассные компании с чистым балансом ({alt_str})."
-    )
-
-
-def run_buffett_audit(portfolio: Dict[str, dict], tracked: Dict[str, dict],
-                      state: dict, force_notify: bool = False) -> None:
-    fund_map = load_fundamentals()
-    now = datetime.now(MSK_TZ)
-    ts = now.strftime("%H:%M:%S")
-    date_str = now.strftime("%Y-%m-%d")
-
-    print("\n" + "=" * 90)
-    print(f"[{ts}] АУДИТ КАЧЕСТВА БИЗНЕСА ПО БАФФЕТУ (Buffett Economic Moat Audit)")
-    print("=" * 90)
-    print(f"{'Тикер':6} | {'Компания':18} | {'Сектор':15} | {'Статус':10} | {'Экономический ров (Moat)'}")
-    print("-" * 90)
-
-    alerts = []
-    for t, pos in portfolio.items():
-        if t in GOLD_TICKERS:
-            print(f"{t:6} | {'Золото (БПИФ)':18} | {'Сырьё/Защита':15} | {'EXCELLENT':10} | Физическое золото")
+        cash = float(raw.get("CASH", 0.0) or 0.0)
+    except Exception:
+        return {}, 0.0, f"{filepath}: CASH не число"
+    positions: Dict[str, dict] = {}
+    for key, value in raw.items():
+        if key.upper() == "CASH":
             continue
-
-        st = tracked.get(t)
-        fund = fund_map.get(t, {})
-        name = fund.get("name", t)[:18]
-        sec = fund.get("sector", "-")[:15]
-
-        status, reasons = evaluate_buffett_health(t, pos, st, fund_map)
-        moat_short = fund.get("moat", "-")[:35]
-        print(f"{t:6} | {name:18} | {sec:15} | {status:10} | {moat_short}")
-
-        if status in ("BAD", "WARNING") and reasons:
-            alerts.append((t, status, reasons))
-
-    print("=" * 90 + "\n")
-
-    for t, status, reasons in alerts:
-        msg = format_buffett_warning_message(t, status, reasons, fund_map)
-        key = f"{t}_BUFFETT_{date_str}" if not force_notify else f"{t}_BUFFETT_FORCE_{int(time.time())}"
-        if key not in state.get("notified_buffett", []):
-            if dispatch_notification(key, "BUFFETT_ALERT", t, msg):
-                print(f"[{ts}] [БАФФЕТ-ПРЕДУПРЕЖДЕНИЕ] {t}: {status} — уведомление отправлено!")
-                state.setdefault("notified_buffett", []).append(key)
+        if not isinstance(value, dict):
+            return {}, 0.0, f"{filepath}: позиция {key} не объект"
+        if "count" not in value or "buy_price" not in value:
+            return {}, 0.0, f"{filepath}: позиция {key} без count/buy_price"
+        try:
+            count = int(value["count"])
+            buy_price = float(value["buy_price"])
+        except Exception:
+            return {}, 0.0, f"{filepath}: позиция {key} содержит нечисловые поля"
+        if count < 0 or buy_price <= 0:
+            return {}, 0.0, f"{filepath}: позиция {key} имеет count<0 или buy_price<=0"
+        if count == 0:
+            continue
+        positions[key.upper()] = {"count": count, "buy_price": buy_price}
+    return positions, cash, None
 
 
 # ==============================================================================
-# 4. MOEX ISS
+# 5. ИДЕИ ВТБ
+# ==============================================================================
+
+def load_ideas() -> Tuple[Dict[str, dict], List[str], bool]:
+    """Возвращает (идеи, предупреждения, файл_доступен)."""
+    warnings: List[str] = []
+    raw, err = _load_json_file(IDEAS_FILE)
+    if err:
+        return {}, [f"{err}: новые покупки отключены"], False
+    if not isinstance(raw, dict):
+        return {}, [f"{IDEAS_FILE}: корневой элемент не объект"], False
+    ideas: Dict[str, dict] = {}
+    for ticker, value in raw.items():
+        if ticker.startswith("_"):
+            continue
+        if not isinstance(value, dict):
+            warnings.append(f"{IDEAS_FILE}: {ticker} — не объект, пропущено")
+            continue
+        ideas[ticker.upper()] = value
+    return ideas, warnings, True
+
+
+def validate_idea(ticker: str, idea: dict) -> List[str]:
+    errors: List[str] = []
+    for field in ("entry_low", "entry_high", "target", "published", "valid_until",
+                  "conviction"):
+        if field not in idea:
+            errors.append(f"{ticker}: отсутствует поле {field}")
+    try:
+        entry_low = float(idea.get("entry_low"))
+        entry_high = float(idea.get("entry_high"))
+        target = float(idea.get("target"))
+    except Exception:
+        return errors + [f"{ticker}: entry_low/entry_high/target должны быть числами"]
+
+    if entry_low <= 0 or entry_high <= 0 or target <= 0:
+        errors.append(f"{ticker}: цены должны быть > 0")
+    if entry_low > entry_high:
+        errors.append(f"{ticker}: entry_low > entry_high")
+    if target <= entry_high:
+        errors.append(f"{ticker}: target <= entry_high")
+    if "stop" in idea and idea["stop"] is not None:
+        try:
+            stop = float(idea["stop"])
+            if stop <= 0:
+                errors.append(f"{ticker}: stop <= 0")
+            elif stop >= entry_low:
+                errors.append(f"{ticker}: stop >= entry_low")
+        except Exception:
+            errors.append(f"{ticker}: stop не число")
+
+    published = _parse_iso_date(idea.get("published"))
+    valid_until = _parse_iso_date(idea.get("valid_until"))
+    if published is None:
+        errors.append(f"{ticker}: published не дата YYYY-MM-DD")
+    if valid_until is None:
+        errors.append(f"{ticker}: valid_until не дата YYYY-MM-DD")
+    if published and valid_until:
+        if published >= valid_until:
+            errors.append(f"{ticker}: published >= valid_until")
+        horizon = (valid_until - published).days
+        if horizon > MAX_TRADING_HORIZON_DAYS:
+            errors.append(
+                f"{ticker}: горизонт {horizon} дн. > {MAX_TRADING_HORIZON_DAYS}; "
+                f"идея не для среднесрочной торговли"
+            )
+    try:
+        conviction = int(idea.get("conviction"))
+        if conviction < 1 or conviction > 5:
+            errors.append(f"{ticker}: conviction должен быть 1..5")
+    except Exception:
+        errors.append(f"{ticker}: conviction не целое 1..5")
+    if idea.get("active", True) is False:
+        errors.append(f"{ticker}: идея деактивирована")
+    return errors
+
+
+def active_idea_for(ticker: str, ideas: Dict[str, dict], today: date) -> Optional[dict]:
+    idea = ideas.get(ticker)
+    if not idea or idea.get("active", True) is False:
+        return None
+    valid_until = _parse_iso_date(idea.get("valid_until"))
+    published = _parse_iso_date(idea.get("published"))
+    if valid_until is None or published is None:
+        return None
+    if today < published or today > valid_until:
+        return None
+    return idea
+
+
+def idea_for_management(ticker: str, ideas: Dict[str, dict]) -> Optional[dict]:
+    idea = ideas.get(ticker)
+    if not idea or idea.get("active", True) is False:
+        return None
+    return idea
+
+
+def active_idea_tickers(ideas: Dict[str, dict], today: date) -> set:
+    return {t for t in ideas if active_idea_for(t, ideas, today) is not None}
+
+
+def ideas_check() -> int:
+    """Офлайн-валидация ideas.json и fundamentals.json."""
+    ideas, idea_warnings, ideas_available = load_ideas()
+    fundamentals, fund_warnings, fund_available, stale_days = load_fundamentals()
+    errors: List[str] = []
+    warnings: List[str] = list(idea_warnings) + list(fund_warnings)
+
+    if not ideas_available:
+        errors.append(f"{IDEAS_FILE} недоступен")
+    if not fund_available:
+        errors.append(f"{FUNDAMENTALS_FILE} недоступен")
+    if stale_days is None:
+        warnings.append(
+            f"{FUNDAMENTALS_FILE}: нет _meta.updated; новые входы будут заблокированы"
+        )
+    elif stale_days > FUNDAMENTALS_WARN_DAYS:
+        warnings.append(
+            f"{FUNDAMENTALS_FILE}: данные устарели на {stale_days} дн."
+        )
+
+    print("\n" + "=" * 78)
+    print(f"ПРОВЕРКА ИДЕЙ И ФУНДАМЕНТАЛА — найдено {len(ideas)} идей, "
+          f"{len(fundamentals)} тикеров")
+    print("=" * 78)
+
+    for ticker, idea in sorted(ideas.items()):
+        idea_errors = validate_idea(ticker, idea)
+        errors.extend(idea_errors)
+        if ticker not in fundamentals:
+            warnings.append(f"{ticker}: нет в {FUNDAMENTALS_FILE}")
+        status = "OK" if not idea_errors else "ОШИБКА"
+        print(f"{ticker:<7} {status:<8} target={idea.get('target')} "
+              f"valid_until={idea.get('valid_until')} "
+              f"conviction={idea.get('conviction')}")
+        for e in idea_errors:
+            print(f"  ✗ {e}")
+
+    for ticker, fund in sorted(fundamentals.items()):
+        missing = [k for k in ("pe", "pb", "roe", "fcf_yield") if fund.get(k) is None]
+        if missing:
+            warnings.append(f"{ticker}: не заполнены {', '.join(missing)}")
+
+    if errors:
+        print("\nОШИБКИ:")
+        for e in errors:
+            print(f"  ✗ {e}")
+    if warnings:
+        print("\nПРЕДУПРЕЖДЕНИЯ:")
+        for w in warnings:
+            print(f"  ! {w}")
+    if not errors:
+        print("\nСтруктурных ошибок нет.")
+    return 1 if errors else 0
+
+
+# ==============================================================================
+# 6. ФУНДАМЕНТАЛ
+# ==============================================================================
+
+def _normalize_fundamental(ticker: str, raw: dict) -> dict:
+    roe = raw.get("roe", raw.get("roe_pct"))
+    return {
+        "name": raw.get("name", ticker),
+        "sector": normalize_sector(raw.get("sector", "Прочее")),
+        "listing_level": int(raw.get("listing_level", 1) or 1),
+        "pe": _to_float_or_none(raw.get("pe")),
+        "pb": _to_float_or_none(raw.get("pb")),
+        "ev_ebitda": _to_float_or_none(raw.get("ev_ebitda")),
+        "roe": _to_float_or_none(roe),
+        "fcf_yield": _to_float_or_none(raw.get("fcf_yield")),
+        "fcf_positive": raw.get("fcf_positive"),
+        "net_debt_ebitda": _to_float_or_none(raw.get("net_debt_ebitda")),
+        "eps_growth": _to_float_or_none(raw.get("eps_growth")),
+        "revenue_growth": _to_float_or_none(raw.get("revenue_growth")),
+        "div_yield": _to_float_or_none(raw.get("div_yield")),
+        "earnings_stability": _to_float_or_none(raw.get("earnings_stability")),
+    }
+
+
+def _to_float_or_none(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def load_fundamentals() -> Tuple[Dict[str, dict], List[str], bool, Optional[int]]:
+    """Возвращает (данные, предупреждения, доступен, возраст_дней)."""
+    warnings: List[str] = []
+    raw, err = _load_json_file(FUNDAMENTALS_FILE)
+    if err:
+        return {}, [f"{err}: скринер и новые входы отключены"], False, None
+    if not isinstance(raw, dict):
+        return {}, [f"{FUNDAMENTALS_FILE}: корневой элемент не объект"], False, None
+
+    meta = raw.get("_meta", {}) if isinstance(raw.get("_meta"), dict) else {}
+    stale_days: Optional[int] = None
+    meta_date = _parse_iso_date(meta.get("updated"))
+    if meta_date:
+        stale_days = (datetime.now(MSK_TZ).date() - meta_date).days
+    else:
+        warnings.append(
+            f"{FUNDAMENTALS_FILE}: нет _meta.updated — новые входы будут заблокированы"
+        )
+
+    fundamentals: Dict[str, dict] = {}
+    for ticker, value in raw.items():
+        if ticker.startswith("_"):
+            continue
+        if not isinstance(value, dict):
+            warnings.append(f"{FUNDAMENTALS_FILE}: {ticker} — не объект, пропущено")
+            continue
+        fundamentals[ticker.upper()] = _normalize_fundamental(ticker.upper(), value)
+    return fundamentals, warnings, True, stale_days
+
+
+# ==============================================================================
+# 7. MOEX ISS
 # ==============================================================================
 
 def create_moex_session() -> requests.Session:
@@ -531,13 +744,15 @@ def create_moex_session() -> requests.Session:
     return session
 
 
-def get_moex_market_data(max_attempts: int = MOEX_MAX_RETRIES) -> Tuple[Dict[str, dict], List[dict]]:
+def get_moex_market_data(
+    priority_tickers: Optional[set] = None,
+) -> Tuple[Dict[str, dict], List[dict]]:
     url = ("https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities.json"
            "?iss.meta=off&iss.only=securities,marketdata")
     session = create_moex_session()
     payload = None
     last_err = None
-    for attempt in range(1, max_attempts + 1):
+    for attempt in range(1, MOEX_MAX_RETRIES + 1):
         try:
             r = session.get(url, timeout=(MOEX_CONNECT_TIMEOUT, MOEX_READ_TIMEOUT))
             r.raise_for_status()
@@ -545,9 +760,10 @@ def get_moex_market_data(max_attempts: int = MOEX_MAX_RETRIES) -> Tuple[Dict[str
             break
         except requests.RequestException as e:
             last_err = e
-            if attempt < max_attempts:
+            if attempt < MOEX_MAX_RETRIES:
                 sleep_time = attempt * 3
-                print(f"[СЕТЬ] Попытка {attempt}/{max_attempts}: {e}. Ждём {sleep_time}с...")
+                print(f"[СЕТЬ] Попытка {attempt}/{MOEX_MAX_RETRIES}: {e}. "
+                      f"Ждём {sleep_time}с...")
                 time.sleep(sleep_time)
     if payload is None:
         raise last_err if last_err else RuntimeError("Не удалось получить данные MOEX")
@@ -560,19 +776,26 @@ def get_moex_market_data(max_attempts: int = MOEX_MAX_RETRIES) -> Tuple[Dict[str
             "lot_size": int(row[sec_cols.index("LOTSIZE")] or 1),
             "name": row[sec_cols.index("SHORTNAME")],
             "sec_type": str(row[sec_cols.index("SECTYPE")]),
+            "listing_level": (
+                int(row[sec_cols.index("LISTLEVEL")] or 1)
+                if "LISTLEVEL" in sec_cols else 1
+            ),
         }
 
     m_cols = payload["marketdata"]["columns"]
-    i_sec  = m_cols.index("SECID")
+    i_sec = m_cols.index("SECID")
     i_last = m_cols.index("LAST")
     i_high = m_cols.index("HIGH") if "HIGH" in m_cols else None
-    i_chg  = m_cols.index("LASTTOPREVPRICE")
-    i_vol  = m_cols.index("VALTODAY")
-    i_bid  = m_cols.index("BID") if "BID" in m_cols else None
-    i_ask  = m_cols.index("OFFER") if "OFFER" in m_cols else None
+    i_chg = m_cols.index("LASTTOPREVPRICE")
+    i_vol = m_cols.index("VALTODAY")
+    i_bid = m_cols.index("BID") if "BID" in m_cols else None
+    i_ask = m_cols.index("OFFER") if "OFFER" in m_cols else None
 
-    all_stocks = {}
-    liquid = []
+    all_stocks: Dict[str, dict] = {}
+    liquid: List[dict] = []
+    priority = priority_tickers or set()
+    priority = {t.upper() for t in priority}
+
     for row in payload["marketdata"]["data"]:
         t = row[i_sec]
         last = row[i_last]
@@ -599,61 +822,63 @@ def get_moex_market_data(max_attempts: int = MOEX_MAX_RETRIES) -> Tuple[Dict[str
             "volume": float(vol),
             "lot_size": info["lot_size"],
             "name": info["name"],
+            "listing_level": info["listing_level"],
             "is_gold": is_gold,
         }
         all_stocks[t] = stock
-        if stock["volume"] >= MIN_DAILY_VOLUME or is_gold:
+        if stock["volume"] >= MIN_DAILY_VOLUME or is_gold or t in priority:
             liquid.append(stock)
 
     liquid.sort(key=lambda s: s["volume"], reverse=True)
     top = liquid[:TOP_N_LIQUID]
     existing = {s["ticker"] for s in top}
-
-    # Всегда включаем золото, бумаги портфеля и первоклассные компании Баффета
-    priority_tickers = set(GOLD_TICKERS)
-    if os.path.exists(PORTFOLIO_FILE):
-        try:
-            with open(PORTFOLIO_FILE, "r", encoding="utf-8") as f:
-                p_raw = json.load(f)
-                priority_tickers.update(k.upper() for k in p_raw.keys() if k.upper() != "CASH")
-        except Exception:
-            pass
-    fund_map = load_fundamentals()
-    for t, f in fund_map.items():
-        if f.get("status") in ("EXCELLENT", "GOOD"):
-            priority_tickers.add(t)
-
     for s in liquid:
-        t = s["ticker"]
-        if t in priority_tickers and t not in existing:
+        if s["ticker"] in priority and s["ticker"] not in existing:
             top.append(s)
-            existing.add(t)
+            existing.add(s["ticker"])
     return all_stocks, top
 
 
-def fetch_candles(ticker: str, session: requests.Session) -> list:
+def fetch_candles(ticker: str, session: requests.Session,
+                  days: int = CANDLES_DAYS_STOCKS) -> list:
     now = time.time()
     cached = _candles_cache.get(ticker)
-    if cached and (now - cached[0]) < CANDLES_CACHE_TTL:
-        return cached[1]
-    days_back = 400 if ticker in GOLD_TICKERS else 120
-    from_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    if cached and (now - cached[0]) < CANDLES_CACHE_TTL and cached[1] == days:
+        return cached[2]
+    from_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
     url = (f"https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/"
            f"securities/{ticker}/candles.json?interval=24&from={from_date}&iss.meta=off")
     try:
         res = session.get(url, timeout=(MOEX_CONNECT_TIMEOUT, 15)).json()
         candles = res.get("candles", {}).get("data", [])
-        _candles_cache[ticker] = (now, candles)
+        _candles_cache[ticker] = (now, days, candles)
+        return candles
+    except Exception:
+        return []
+
+
+def fetch_index_candles(session: requests.Session) -> list:
+    global _index_candles_cache
+    now = time.time()
+    if _index_candles_cache and (now - _index_candles_cache[0]) < CANDLES_CACHE_TTL:
+        return _index_candles_cache[1]
+    from_date = (datetime.now() - timedelta(days=CANDLES_DAYS_INDEX)).strftime("%Y-%m-%d")
+    url = ("https://iss.moex.com/iss/engines/stock/markets/index/securities/IMOEX/"
+           f"candles.json?interval=24&from={from_date}&iss.meta=off")
+    try:
+        res = session.get(url, timeout=(MOEX_CONNECT_TIMEOUT, 15)).json()
+        candles = res.get("candles", {}).get("data", [])
+        _index_candles_cache = (now, candles)
         return candles
     except Exception:
         return []
 
 
 # ==============================================================================
-# 5. ИНДИКАТОРЫ
+# 8. ИНДИКАТОРЫ
 # ==============================================================================
 
-def _rsi(closes: List[float], period: int = 14) -> float:
+def _rsi(closes: List[float], period: int = RSI_WINDOW_DAYS) -> float:
     if len(closes) < period + 1:
         return 50.0
     gains, losses = [], []
@@ -672,7 +897,7 @@ def _rsi(closes: List[float], period: int = 14) -> float:
     return 100.0 - 100.0 / (1.0 + rs)
 
 
-def _atr(candles: List[list], period: int = 14) -> float:
+def _atr(candles: List[list], period: int = ATR_WINDOW_DAYS) -> float:
     if len(candles) < period + 1:
         return 0.0
     trs = []
@@ -710,65 +935,251 @@ def _sma(closes: List[float], period: int) -> Optional[float]:
     return sum(closes[-period:]) / period
 
 
-def enrich_with_indicators(stocks: List[dict], max_workers: int = 6) -> None:
-    def worker(stock: dict):
+def _stdev(values: List[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    return statistics.stdev(values)
+
+
+def _returns(closes: List[float]) -> List[float]:
+    result = []
+    for i in range(1, len(closes)):
+        prev = closes[i - 1]
+        cur = closes[i]
+        if prev and cur and prev > 0:
+            result.append(cur / prev - 1.0)
+    return result
+
+
+def _realized_vol(closes: List[float], period: int = 60) -> float:
+    if len(closes) < 3:
+        return 0.0
+    rets = _returns(closes[-(period + 1):])
+    if len(rets) < 2:
+        return 0.0
+    return _stdev(rets) * math.sqrt(252.0)
+
+
+def _max_drawdown(closes: List[float], period: int = 252) -> float:
+    window = closes[-period:] if period > 0 else closes
+    if len(window) < 2:
+        return 0.0
+    peak = window[0]
+    max_dd = 0.0
+    for price in window[1:]:
+        if price > peak:
+            peak = price
+        elif peak > 0:
+            dd = (peak - price) / peak
+            max_dd = max(max_dd, dd)
+    return max_dd
+
+
+def _momentum(closes: List[float], lookback: int, skip: int = 21) -> float:
+    if len(closes) < lookback + skip + 1:
+        return 0.0
+    start = closes[-1 - lookback - skip]
+    end = closes[-1 - skip]
+    if start <= 0:
+        return 0.0
+    return end / start - 1.0
+
+
+def _linreg_slope(values: List[float]) -> float:
+    n = len(values)
+    if n < 2:
+        return 0.0
+    x_mean = (n - 1) / 2.0
+    y_mean = sum(values) / n
+    num = sum((i - x_mean) * (v - y_mean) for i, v in enumerate(values))
+    den = sum((i - x_mean) ** 2 for i in range(n))
+    return num / den if den else 0.0
+
+
+def _correlation(x: List[float], y: List[float]) -> float:
+    n = min(len(x), len(y))
+    if n < 5:
+        return 0.0
+    a = x[-n:]
+    b = y[-n:]
+    mean_a = sum(a) / n
+    mean_b = sum(b) / n
+    cov = sum((a[i] - mean_a) * (b[i] - mean_b) for i in range(n))
+    var_a = sum((v - mean_a) ** 2 for v in a)
+    var_b = sum((v - mean_b) ** 2 for v in b)
+    if var_a <= 0 or var_b <= 0:
+        return 0.0
+    return cov / math.sqrt(var_a * var_b)
+
+
+def _beta(stock_returns: List[float], index_returns: List[float]) -> float:
+    n = min(len(stock_returns), len(index_returns))
+    if n < 20:
+        return 1.0
+    s = stock_returns[-n:]
+    m = index_returns[-n:]
+    mean_s = sum(s) / n
+    mean_m = sum(m) / n
+    cov = sum((s[i] - mean_s) * (m[i] - mean_m) for i in range(n))
+    var_m = sum((v - mean_m) ** 2 for v in m)
+    if var_m <= 0:
+        return 1.0
+    return cov / var_m
+
+
+def _ou_half_life(closes: List[float]) -> Optional[float]:
+    values = [c for c in closes if c and c > 0]
+    if len(values) < 30:
+        return None
+    logs = [math.log(v) for v in values[-120:]]
+    y = logs[1:]
+    x = logs[:-1]
+    n = len(x)
+    mean_x = sum(x) / n
+    mean_y = sum(y) / n
+    cov = sum((x[i] - mean_x) * (y[i] - mean_y) for i in range(n))
+    var_x = sum((v - mean_x) ** 2 for v in x)
+    if var_x <= 0:
+        return None
+    b = cov / var_x
+    if 0 < b < 1:
+        return -math.log(2.0) / math.log(b)
+    return None
+
+
+def _percentile(values: List[float], p: float) -> float:
+    if not values:
+        return 0.0
+    s = sorted(values)
+    k = (len(s) - 1) * p
+    f = int(k)
+    c = min(f + 1, len(s) - 1)
+    if f == c:
+        return s[f]
+    return s[f] + (s[c] - s[f]) * (k - f)
+
+
+def _robust_z_map(
+    rows: List[dict], metric: str, sector_key: str = "sector",
+) -> Dict[str, float]:
+    """Sector-neutral winsorized z-score по метрике."""
+    pairs = [(r["ticker"], float(r[metric]), r.get(sector_key, "Прочее"))
+             for r in rows if r.get(metric) is not None]
+    if not pairs:
+        return {}
+    raw_values = [p[1] for p in pairs]
+    lo = _percentile(raw_values, 0.05)
+    hi = _percentile(raw_values, 0.95)
+    clamped = [(t, min(max(v, lo), hi), s) for t, v, s in pairs]
+    all_values = [p[1] for p in clamped]
+    median_all = statistics.median(all_values)
+    mad = statistics.median([abs(v - median_all) for v in all_values])
+    if mad <= 0:
+        mad = statistics.pstdev(all_values) if len(all_values) > 1 else 0.0
+    if mad <= 0:
+        return {t: 0.0 for t, _, _ in clamped}
+    sector_values: Dict[str, List[float]] = {}
+    for _, v, s in clamped:
+        sector_values.setdefault(s, []).append(v)
+    result: Dict[str, float] = {}
+    for t, v, s in clamped:
+        median_sector = (statistics.median(sector_values[s])
+                         if len(sector_values[s]) >= MIN_SECTOR_NAMES else median_all)
+        z = (v - median_sector) / (1.4826 * mad)
+        result[t] = max(-ZSCORE_CLIP, min(ZSCORE_CLIP, z))
+    return result
+
+
+def enrich_with_indicators(stocks: List[dict], index_closes: Optional[List[float]] = None,
+                           max_workers: int = 6) -> None:
+    index_returns = _returns(index_closes or [])
+
+    def worker(stock: dict) -> None:
         session = create_moex_session()
         ticker = stock["ticker"]
-        candles = fetch_candles(ticker, session)
+        days = CANDLES_DAYS_GOLD if ticker in GOLD_TICKERS else CANDLES_DAYS_STOCKS
+        try:
+            candles = fetch_candles(ticker, session, days)
+        except Exception:
+            candles = []
 
-        stock.setdefault("sma", stock["last"])
-        stock.setdefault("stdev", 0.0)
-        stock.setdefault("z_score", 0.0)
-        stock.setdefault("rsi", 50.0)
-        stock.setdefault("atr", 0.0)
-        stock.setdefault("atr_pct", 0.0)
-        stock.setdefault("ema50", stock["last"])
-        stock.setdefault("trend_up", True)
-        stock.setdefault("highest_high", stock["last"])
-        stock.setdefault("sma200", None)
-        stock.setdefault("above_sma200", False)
+        defaults = {
+            "sma20": None, "sma50": None, "sma200": None, "sma200_slope_pct": 0.0,
+            "ema50": stock["last"], "z20": 0.0, "rsi": 50.0, "atr": 0.0,
+            "atr_pct": 0.0, "momentum_12_1": 0.0, "momentum_6_1": 0.0,
+            "vol60": 0.0, "max_dd_252": 0.0, "beta": 1.0, "ou_half_life": None,
+            "highest_high": stock["last"], "avg_value_20": 0.0,
+            "returns_60": [], "closes_hist": [],
+            "trend_up": True, "above_sma200": False, "trend_ok": True,
+        }
+        for key, value in defaults.items():
+            stock.setdefault(key, value)
 
         if len(candles) < 2:
+            stock["rsi"] = 50.0
             return
 
-        closes = [c[1] for c in candles if c[1] is not None]
-        highs  = [c[2] for c in candles if c[2] is not None]
+        closes = [float(c[1]) for c in candles if c[1] is not None]
+        highs = [float(c[2]) for c in candles if c[2] is not None]
+        values = [float(c[4]) for c in candles if len(c) > 4 and c[4] is not None]
+        if len(closes) < 2:
+            return
 
-        closes_hist = closes[:-1] if len(closes) > SMA_WINDOW_DAYS else closes
-        if len(closes_hist) >= SMA_WINDOW_DAYS:
-            sample = closes_hist[-SMA_WINDOW_DAYS:]
-            sma = statistics.mean(sample)
-            stdev = statistics.stdev(sample) if len(sample) > 1 else 0.0
-            stock["sma"] = sma
-            stock["stdev"] = stdev
-            stock["z_score"] = (stock["last"] - sma) / stdev if stdev > 0 else 0.0
+        last = stock["last"] if stock.get("last", 0) > 0 else closes[-1]
+        stock["last"] = last
 
-        stock["rsi"] = _rsi(closes, RSI_WINDOW_DAYS)
+        if len(closes) >= 20:
+            sample = closes[-20:]
+            sma20 = statistics.mean(sample)
+            stdev20 = statistics.stdev(sample) if len(sample) > 1 else 0.0
+            stock["sma20"] = sma20
+            stock["z20"] = (last - sma20) / stdev20 if stdev20 > 0 else 0.0
 
+        stock["sma50"] = _sma(closes, 50)
+        sma200 = _sma(closes, 200)
+        stock["sma200"] = sma200
+        if sma200 and sma200 > 0:
+            slope = _linreg_slope(closes[-60:]) if len(closes) >= 60 else 0.0
+            stock["sma200_slope_pct"] = slope / sma200 * 100.0
+
+        stock["ema50"] = _ema(closes, TREND_EMA_PERIOD)
+        stock["rsi"] = _rsi(closes + [last], RSI_WINDOW_DAYS)
         atr = _atr(candles, ATR_WINDOW_DAYS)
         stock["atr"] = atr
-        stock["atr_pct"] = (atr / stock["last"] * 100.0) if stock["last"] > 0 else 0.0
-
-        ema50 = _ema(closes, TREND_EMA_PERIOD)
-        stock["ema50"] = ema50
-        stock["trend_up"] = stock["last"] > ema50
+        stock["atr_pct"] = (atr / last * 100.0) if last > 0 else 0.0
+        stock["momentum_12_1"] = _momentum(closes, 252, 21)
+        stock["momentum_6_1"] = _momentum(closes, 126, 21)
+        stock["vol60"] = _realized_vol(closes, 60)
+        stock["max_dd_252"] = _max_drawdown(closes, 252)
+        stock["ou_half_life"] = _ou_half_life(closes)
+        stock["returns_60"] = _returns(closes[-(60 + 1):])
+        stock["closes_hist"] = closes[-260:]
+        if index_returns:
+            stock["beta"] = _beta(stock["returns_60"], index_returns[-60:])
 
         n = min(TRAILING_LOOKBACK_DAYS, len(highs))
-        stock["highest_high"] = max(highs[-n:]) if n > 0 else stock["last"]
+        stock["highest_high"] = max(highs[-n:]) if n > 0 else last
+        if values:
+            stock["avg_value_20"] = statistics.mean(values[-20:])
 
-        sma200 = _sma(closes, GOLD_MA_PERIOD)
-        stock["sma200"] = sma200
-        stock["above_sma200"] = (sma200 is not None and stock["last"] > sma200)
+        stock["trend_up"] = last > stock["ema50"]
+        stock["above_sma200"] = bool(sma200 is not None and last > sma200)
+        stock["trend_ok"] = bool(
+            (stock["above_sma200"] and stock["sma200_slope_pct"] > 0)
+            or (stock["sma50"] is not None and last > stock["sma50"]
+                and sma200 is not None and stock["sma50"] > sma200)
+        )
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         list(ex.map(worker, stocks))
 
 
 # ==============================================================================
-# 6. ЧИСТАЯ ПРИБЫЛЬ
+# 9. ИЗДЕРЖКИ, БЕЗУБЫТОК, ОЖИДАНИЕ
 # ==============================================================================
 
 def net_proceeds(shares: int, sell_price: float, buy_price: float) -> dict:
+    shares = max(0, int(shares))
     gross = shares * sell_price
     comm_sell = gross * COMMISSION_PCT / 100.0
     comm_buy = shares * buy_price * COMMISSION_PCT / 100.0
@@ -783,643 +1194,1714 @@ def net_proceeds(shares: int, sell_price: float, buy_price: float) -> dict:
     }
 
 
-# ==============================================================================
-# 7. ИНИЦИАЛИЗАЦИЯ И СИНХРОНИЗАЦИЯ
-# ==============================================================================
+def breakeven_price(buy_price: float) -> float:
+    if buy_price <= 0:
+        return buy_price
+    c = COMMISSION_PCT / 100.0
+    tau = TAX_PCT / 100.0 if INCLUDE_TAX else 0.0
+    den = 1.0 - tau - c
+    if den <= 0:
+        return buy_price
+    return buy_price * (1.0 - tau + c) / den
 
-def init_position(ticker: str, pos: dict, stock: dict, state: dict) -> bool:
-    atr = stock.get("atr", 0.0)
-    if atr <= 0:
-        return False
-    buy = pos["buy_price"]
-    count = pos["count"]
-    lot = stock["lot_size"]
-    is_gold = ticker in GOLD_TICKERS
 
-    # Ядро (только для акций, не для золота)
-    raw_core = pos.get("core_count", 0)
-    if is_gold:
-        core_count = 0
-    else:
-        core_count = min(raw_core, count) // lot * lot
-        if core_count < 0:
-            core_count = 0
+def bayesian_win_rate(stats: dict) -> float:
+    wins = max(0, int(stats.get("wins", 0) or 0))
+    losses = max(0, int(stats.get("losses", 0) or 0))
+    p = (wins + PRIOR_WINS) / (wins + losses + PRIOR_WINS + PRIOR_LOSSES)
+    return max(P_WIN_MIN, min(P_WIN_MAX, p))
 
-    if is_gold:
-        levels = GOLD_TAKE_PROFIT_LEVELS
-        stop_atr = GOLD_STOP_ATR
-    else:
-        levels = TAKE_PROFIT_ATR_LEVELS
-        stop_atr = INITIAL_STOP_ATR
 
-    targets = [buy + atr * lvl["atr_mult"] for lvl in levels]
-    initial_stop = buy - atr * stop_atr
-
-    state["positions"][ticker] = {
-        "entry_atr": atr,
-        "entry_price": buy,
-        "buy_price": buy,
-        "original_count": count,
-        "core_count": core_count,
-        "targets": targets,
-        "initial_stop": initial_stop,
-        "tp1_hit": False,
-        "sold": 0,
-        "peak": max(buy, stock["last"], stock.get("high", stock["last"]), stock.get("highest_high", stock["last"])),
-        "is_gold": is_gold,
+def trade_expectancy(anchor: float, stop: float, target: float,
+                     p: float) -> Optional[dict]:
+    if anchor <= 0 or stop <= 0 or target <= 0 or stop >= anchor or target <= anchor:
+        return None
+    r = anchor - stop
+    if r <= 0:
+        return None
+    c = (COMMISSION_PCT + SLIPPAGE_PCT) / 100.0
+    tau = TAX_PCT / 100.0 if INCLUDE_TAX else 0.0
+    net_win = (target - anchor) * (1.0 - tau) - c * (target + anchor)
+    net_loss = r + c * (anchor + stop)
+    target_r = (target - anchor) / r
+    expectancy_r = p * (net_win / r) - (1.0 - p) * (net_loss / r)
+    return {
+        "R": r,
+        "target_r": target_r,
+        "upside_pct": (target / anchor - 1.0) * 100.0,
+        "risk_pct": r / anchor * 100.0,
+        "net_win": net_win,
+        "net_loss": net_loss,
+        "expectancy_r": expectancy_r,
+        "p": p,
     }
 
-    if not is_gold and lot > 0:
-        tradable = count - core_count
-        if tradable < lot:
-            print(f"[ИНФО] {ticker}: только ядро ({core_count} шт.), спутник отсутствует.")
 
+# ==============================================================================
+# 10. ПЛАНЫ И ЛАДДЕР
+# ==============================================================================
+
+def _stage_from_sold(levels: List[dict], sold: int) -> int:
+    stage = 0
+    for level in levels:
+        if sold >= int(level.get("cum_count", 0)):
+            stage += 1
+        else:
+            break
+    return stage
+
+
+def build_levels(anchor: float, stop: float, target: float,
+                 original_count: int, lot: int) -> Optional[List[dict]]:
+    """Динамический ладдер по R и цели ВТБ. Последняя ступень — весь остаток."""
+    if lot <= 0 or original_count <= 0:
+        return None
+    r = anchor - stop
+    if r <= 0 or target <= anchor:
+        return None
+    target_r = (target - anchor) / r
+    if target_r < MIN_RR:
+        return None
+
+    if original_count <= lot:
+        return [{
+            "name": "TP1", "price": float(target), "cum_pct": 1.0,
+            "cum_count": original_count, "is_final": True,
+        }]
+
+    if original_count < 3 * lot:
+        cum1 = lot
+        return [
+            {"name": "TP1", "price": float(anchor + TP1_R * r),
+             "cum_pct": cum1 / original_count, "cum_count": cum1, "is_final": False},
+            {"name": "TP2", "price": float(target), "cum_pct": 1.0,
+             "cum_count": original_count, "is_final": True},
+        ]
+
+    if target_r >= 3.0:
+        specs = [
+            ("TP1", anchor + TP1_R * r, TP1_SELL_PCT_3, False),
+            ("TP2", anchor + TP2_R * r, TP1_SELL_PCT_3 + TP2_SELL_PCT_3, False),
+            ("TP3", target, 1.0, True),
+        ]
+    else:
+        specs = [
+            ("TP1", anchor + TP1_R * r, TP1_SELL_PCT_2, False),
+            ("TP2", target, 1.0, True),
+        ]
+
+    levels: List[dict] = []
+    for name, price, cum_pct, is_final in specs:
+        if is_final:
+            cum_count = original_count
+        else:
+            cum_count = int(original_count * cum_pct / lot) * lot
+        if cum_count < lot:
+            continue
+        levels.append({
+            "name": name,
+            "price": float(price),
+            "cum_pct": float(cum_pct),
+            "cum_count": int(cum_count),
+            "is_final": bool(is_final),
+        })
+    if not levels:
+        return None
+    if not levels[-1]["is_final"]:
+        return None
+    # Гарантируем монотонность и наличие финальной ступени.
+    for i in range(1, len(levels)):
+        if levels[i]["cum_count"] <= levels[i - 1]["cum_count"]:
+            levels[i]["cum_count"] = min(
+                original_count,
+                levels[i - 1]["cum_count"] + lot,
+            )
+    levels[-1]["cum_count"] = original_count
+    return levels
+
+
+def build_legacy_levels(anchor: float, atr: float,
+                        original_count: int, lot: int) -> Optional[List[dict]]:
+    """Технический wind-down для позиций без идеи ВТБ."""
+    if lot <= 0 or original_count <= 0 or atr <= 0:
+        return None
+    if original_count <= lot:
+        return [{
+            "name": "TP1", "price": float(anchor + 3.0 * atr), "cum_pct": 1.0,
+            "cum_count": original_count, "is_final": True,
+        }]
+    if original_count < 3 * lot:
+        return [
+            {"name": "TP1", "price": float(anchor + 2.0 * atr),
+             "cum_pct": lot / original_count, "cum_count": lot, "is_final": False},
+            {"name": "TP2", "price": float(anchor + 6.0 * atr),
+             "cum_pct": 1.0, "cum_count": original_count, "is_final": True},
+        ]
+    cum1 = int(original_count * 0.40 / lot) * lot
+    cum2 = int(original_count * 0.70 / lot) * lot
+    if cum1 < lot:
+        cum1 = lot
+    if cum2 <= cum1:
+        cum2 = min(original_count, cum1 + lot)
+    return [
+        {"name": "TP1", "price": float(anchor + 2.0 * atr),
+         "cum_pct": cum1 / original_count, "cum_count": cum1, "is_final": False},
+        {"name": "TP2", "price": float(anchor + 4.0 * atr),
+         "cum_pct": cum2 / original_count, "cum_count": cum2, "is_final": False},
+        {"name": "TP3", "price": float(anchor + 6.0 * atr),
+         "cum_pct": 1.0, "cum_count": original_count, "is_final": True},
+    ]
+
+
+def initial_stop_for_idea(idea: dict, anchor: float, atr: float) -> Optional[float]:
+    if atr <= 0 or anchor <= 0:
+        return None
+    try:
+        entry_low = float(idea["entry_low"])
+    except Exception:
+        return None
+    structural = entry_low - 1.0 * atr
+    stop = structural
+    if idea.get("stop") is not None:
+        try:
+            stop = max(stop, float(idea["stop"]))
+        except Exception:
+            pass
+    if stop <= 0 or stop >= anchor:
+        return None
+    if (anchor - stop) / anchor > MAX_STOP_DISTANCE_PCT / 100.0:
+        return None
+    return float(stop)
+
+
+def initial_stop_for_legacy(anchor: float, atr: float) -> Optional[float]:
+    if anchor <= 0 or atr <= 0:
+        return None
+    distance = min(INITIAL_STOP_ATR * atr, anchor * MAX_STOP_DISTANCE_PCT / 100.0)
+    stop = anchor - distance
+    return stop if stop > 0 else None
+
+
+def build_position_plan(ticker: str, pos: dict, stock: dict, idea: Optional[dict],
+                        today: date, anchor: Optional[float] = None) -> Optional[dict]:
+    atr = float(stock.get("atr", 0.0) or 0.0)
+    lot = int(stock.get("lot_size", 1) or 1)
+    count = int(pos["count"])
+    if atr <= 0 or count <= 0 or lot <= 0:
+        return None
+
+    plan_anchor = float(anchor if anchor is not None else stock["last"])
+    if plan_anchor <= 0:
+        return None
+
+    legacy = idea is None or ticker in GOLD_TICKERS
+    idea_invalid = False
+    stop = None
+    levels = None
+    if not legacy:
+        stop = initial_stop_for_idea(idea, plan_anchor, atr)
+        if stop is not None:
+            levels = build_levels(plan_anchor, stop, float(idea["target"]), count, lot)
+        if stop is None or levels is None:
+            idea_invalid = True
+            stop = initial_stop_for_legacy(plan_anchor, atr)
+            if stop is None:
+                return None
+            levels = build_legacy_levels(plan_anchor, atr, count, lot)
+            if levels is None:
+                return None
+
+    if legacy:
+        stop = initial_stop_for_legacy(plan_anchor, atr)
+        if stop is None:
+            return None
+        levels = build_legacy_levels(plan_anchor, atr, count, lot)
+        if levels is None:
+            return None
+
+    valid_until = (str(idea.get("valid_until"))
+                   if idea and not legacy else
+                   (today + timedelta(days=MAX_LEGACY_HOLDING_DAYS)).isoformat())
+    # Пик нового плана стартует от текущей цены. Дневной максимум и
+    # исторический highest_high относятся к периоду до плана и не должны
+    # поднимать стоп выше текущей цены при миграции/усыновлении идеи.
+    peak = max(plan_anchor, float(stock.get("last", plan_anchor)))
+    risk_per_share = plan_anchor - stop
+    return {
+        "avg_cost": float(pos["buy_price"]),
+        "plan_anchor": float(plan_anchor),
+        "entry_atr": atr,
+        "current_atr": atr,
+        "initial_stop": float(stop),
+        "stop_current": float(stop),
+        "risk_per_share": float(risk_per_share),
+        "initial_risk_rub": float(risk_per_share * count),
+        "levels": levels,
+        "targets": [float(l["price"]) for l in levels],
+        "stage": 0,
+        "sold": 0,
+        "original_count": count,
+        "peak": float(peak),
+        "opened_at": today.isoformat(),
+        "valid_until": valid_until,
+        "idea_target": float(idea["target"]) if idea and not legacy else None,
+        "idea_published": str(idea.get("published")) if idea and not legacy else None,
+        "idea_active": bool(idea is not None and not legacy),
+        "idea_invalid": bool(idea_invalid),
+        "legacy": bool(legacy),
+        "exit_alerted": False,
+        "archived": False,
+        "realized_pnl": 0.0,
+        "realized_r": 0.0,
+        "closed_at": None,
+    }
+
+
+def update_idea_plan(pstate: dict, idea: dict, lot: int) -> bool:
+    """Пересчитывает ладдер при изменении цели/горизонта, сохраняя sold."""
+    if pstate.get("legacy"):
+        return False
+    anchor = float(pstate["plan_anchor"])
+    stop = float(pstate["initial_stop"])
+    levels = build_levels(anchor, stop, float(idea["target"]),
+                          int(pstate["original_count"]), lot)
+    if levels is None:
+        return False
+    pstate["levels"] = levels
+    pstate["targets"] = [float(l["price"]) for l in levels]
+    pstate["valid_until"] = str(idea.get("valid_until"))
+    pstate["idea_target"] = float(idea["target"])
+    pstate["idea_published"] = str(idea.get("published"))
+    pstate["idea_active"] = True
+    pstate["stage"] = _stage_from_sold(levels, int(pstate.get("sold", 0)))
     return True
 
+
+# ==============================================================================
+# 11. РИСК-ДВИЖОК
+# ==============================================================================
+
+def position_values(portfolio: Dict[str, dict], tracked: Dict[str, dict]) -> Dict[str, float]:
+    values: Dict[str, float] = {}
+    for ticker, pos in portfolio.items():
+        stock = tracked.get(ticker)
+        if stock:
+            values[ticker] = float(stock["last"]) * int(pos["count"])
+    return values
+
+
+def portfolio_equity(portfolio: Dict[str, dict], tracked: Dict[str, dict], cash: float) -> float:
+    return cash + sum(position_values(portfolio, tracked).values())
+
+
+def open_portfolio_heat(state: dict, portfolio: Dict[str, dict],
+                        tracked: Dict[str, dict]) -> float:
+    heat = 0.0
+    for ticker, pos in portfolio.items():
+        stock = tracked.get(ticker)
+        pstate = state.get("positions", {}).get(ticker)
+        if not stock or not pstate:
+            continue
+        risk = max(0.0, float(stock["last"]) - float(pstate.get("stop_current", 0.0)))
+        heat += risk * int(pos["count"])
+    return heat
+
+
+def sector_exposure(portfolio: Dict[str, dict], tracked: Dict[str, dict],
+                    fundamentals: Dict[str, dict], sector: str) -> float:
+    total = 0.0
+    for ticker, pos in portfolio.items():
+        stock = tracked.get(ticker)
+        fund = fundamentals.get(ticker, {})
+        if stock and normalize_sector(fund.get("sector", "Прочее")) == sector:
+            total += float(stock["last"]) * int(pos["count"])
+    return total
+
+
+def correlation_cluster(candidate_returns: List[float], values: Dict[str, float],
+                        returns_map: Dict[str, List[float]],
+                        threshold: float = CORR_CLUSTER_THRESHOLD) -> Tuple[float, float, List[str]]:
+    cluster_value = 0.0
+    max_corr = 0.0
+    correlated: List[str] = []
+    for ticker, value in values.items():
+        rets = returns_map.get(ticker, [])
+        if len(rets) < 20 or len(candidate_returns) < 20:
+            continue
+        corr = _correlation(candidate_returns, rets)
+        max_corr = max(max_corr, corr)
+        if corr >= threshold:
+            cluster_value += value
+            correlated.append(ticker)
+    return cluster_value, max_corr, correlated
+
+
+def portfolio_volatility(values: Dict[str, float], returns_map: Dict[str, List[float]],
+                         equity: float) -> float:
+    if equity <= 0 or not values:
+        return 0.0
+    tickers = [t for t in values if values[t] > 0]
+    if not tickers:
+        return 0.0
+    missing = [t for t in tickers if len(returns_map.get(t, [])) < 20]
+    if missing:
+        # Консервативная верхняя оценка: rho = 1.
+        total = 0.0
+        for t in tickers:
+            rets = returns_map.get(t, [])
+            vol = (_stdev(rets) * math.sqrt(252.0)) if len(rets) >= 2 else MAX_PORTFOLIO_VOL_PCT
+            total += values[t] / equity * vol
+        return total
+    n = min(len(returns_map[t]) for t in tickers)
+    series = {t: returns_map[t][-n:] for t in tickers}
+    means = {t: sum(series[t]) / n for t in tickers}
+    cov: Dict[Tuple[str, str], float] = {}
+    for a in tickers:
+        for b in tickers:
+            cov_ab = sum((series[a][i] - means[a]) * (series[b][i] - means[b])
+                         for i in range(n)) / max(1, n - 1)
+            cov[(a, b)] = cov_ab
+    var = 0.0
+    for a in tickers:
+        for b in tickers:
+            var += (values[a] / equity) * (values[b] / equity) * cov[(a, b)]
+    if var <= 0:
+        return 0.0
+    return math.sqrt(var) * math.sqrt(252.0)
+
+
+def plan_entry_size(anchor: float, stop: float, target: float, p: float,
+                    equity: float, cash: float, adv: float, lot: int,
+                    sector_value: float, cluster_value: float, open_risk: float,
+                    pending_value: float, pending_risk: float,
+                    n_positions: int, n_pending: int) -> Tuple[int, dict]:
+    """Fixed-fractional + half-Kelly + все портфельные лимиты."""
+    details: Dict[str, Any] = {}
+    if anchor <= 0 or stop <= 0 or stop >= anchor or lot <= 0 or equity <= 0:
+        return 0, {"reason": "некорректные входные параметры"}
+
+    r = anchor - stop
+    target_r = (target - anchor) / r
+    risk_rub = equity * RISK_PER_TRADE_PCT
+    f_kelly = max(0.0, (p * target_r - (1.0 - p)) / target_r) if target_r > 0 else 0.0
+
+    shares_risk = risk_rub / r
+    shares_position = equity * MAX_POSITION_PCT / anchor
+    shares_cash = max(0.0, cash - equity * MIN_CASH_PCT) / anchor
+    shares_adv = (adv * MAX_ADV_PCT / anchor) if adv > 0 else 0.0
+    shares_kelly = equity * min(KELLY_FRACTION * f_kelly, MAX_POSITION_PCT) / anchor
+    shares_sector = max(0.0, equity * MAX_SECTOR_PCT - sector_value - pending_value) / anchor
+    shares_cluster = max(0.0, equity * MAX_CLUSTER_PCT - cluster_value - pending_value) / anchor
+    shares_heat = max(0.0, equity * MAX_PORTFOLIO_HEAT_PCT - open_risk - pending_risk) / r
+
+    cap = min(shares_risk, shares_position, shares_cash, shares_adv,
+              shares_kelly, shares_sector, shares_cluster, shares_heat)
+    if n_positions + n_pending >= MAX_POSITIONS:
+        cap = 0.0
+    shares = int(cap // lot) * lot
+    if shares <= 0:
+        return 0, {"reason": "лимиты не позволяют купить даже один лот",
+                   "caps": {
+                       "risk": shares_risk, "position": shares_position,
+                       "cash": shares_cash, "adv": shares_adv, "kelly": shares_kelly,
+                       "sector": shares_sector, "cluster": shares_cluster,
+                       "heat": shares_heat,
+                   }}
+
+    details = {
+        "shares": shares,
+        "value": shares * anchor,
+        "risk_rub": shares * r,
+        "risk_pct_equity": shares * r / equity * 100.0,
+        "position_pct_equity": shares * anchor / equity * 100.0,
+        "f_kelly": f_kelly,
+        "caps": {
+            "risk": shares_risk, "position": shares_position,
+            "cash": shares_cash, "adv": shares_adv, "kelly": shares_kelly,
+            "sector": shares_sector, "cluster": shares_cluster,
+            "heat": shares_heat,
+        },
+    }
+    return shares, details
+
+
+def update_circuit_breaker(state: dict, equity: float, today: date) -> dict:
+    today_str = today.isoformat()
+    equity = max(0.0, equity)
+    if state.get("day_date") != today_str:
+        state["day_date"] = today_str
+        state["day_start_equity"] = equity
+    state["equity_peak"] = max(float(state.get("equity_peak", 0.0) or 0.0), equity)
+    peak = float(state.get("equity_peak", 0.0) or 0.0)
+    day_start = float(state.get("day_start_equity", 0.0) or 0.0)
+    drawdown = (1.0 - equity / peak) if peak > 0 else 0.0
+    daily_loss = (1.0 - equity / day_start) if day_start > 0 else 0.0
+    reasons: List[str] = []
+    if drawdown >= PORTFOLIO_DD_HALT_PCT:
+        reasons.append(f"просадка от пика {drawdown*100:.2f}% >= "
+                       f"{PORTFOLIO_DD_HALT_PCT*100:.0f}%")
+    if daily_loss >= MAX_DAILY_LOSS_PCT:
+        reasons.append(f"дневной убыток {daily_loss*100:.2f}% >= "
+                       f"{MAX_DAILY_LOSS_PCT*100:.0f}%")
+    if reasons:
+        state["halt_new_entries_until"] = today_str
+    halt = bool(reasons) or state.get("halt_new_entries_until") == today_str
+    return {
+        "halt": halt,
+        "reasons": reasons,
+        "drawdown": drawdown,
+        "daily_loss": daily_loss,
+        "equity_peak": peak,
+        "day_start_equity": day_start,
+    }
+
+
+# ==============================================================================
+# 12. СИНХРОНИЗАЦИЯ
+# ==============================================================================
+
+def _remove_state_position(state: dict, ticker: str) -> None:
+    state.get("positions", {}).pop(ticker, None)
+    state.get("pending_entries", {}).pop(ticker, None)
+
+
 def sync_state_with_portfolio(state: dict, portfolio: Dict[str, dict],
-                              tracked: Dict[str, dict]) -> List[str]:
-    changes = []
+                              tracked: Dict[str, dict], ideas: Dict[str, dict],
+                              fundamentals: Dict[str, dict],
+                              ideas_available: bool, today: date) -> List[str]:
+    changes: List[str] = []
     pos_state = state["positions"]
 
     for ticker in list(pos_state.keys()):
         if ticker not in portfolio:
-            del pos_state[ticker]
-            changes.append(f"{ticker}: закрыта, удалена из state")
+            p = pos_state[ticker]
+            if p.get("exit_alerted") or int(p.get("sold", 0)) >= int(p.get("original_count", 0)):
+                changes.append(f"{ticker}: закрыта, удалена из state")
+            else:
+                changes.append(f"{ticker}: удалена из portfolio вручную")
+            _remove_state_position(state, ticker)
 
     for ticker, pos in portfolio.items():
-        if ticker not in tracked:
+        stock = tracked.get(ticker)
+        if not stock:
+            changes.append(f"{ticker}: нет рыночных данных, пропуск")
             continue
-        stock = tracked[ticker]
-        atr = stock.get("atr", 0.0)
+        atr = float(stock.get("atr", 0.0) or 0.0)
         if atr <= 0:
+            changes.append(f"{ticker}: ATR=0, пропуск")
             continue
-
-        lot = stock["lot_size"]
         pstate = pos_state.get(ticker)
-
-        # Миграция: если в state нет core_count — добавляем без переинициализации
-        if pstate is not None and "core_count" not in pstate:
-            raw_core = pos.get("core_count", 0)
-            if ticker in GOLD_TICKERS:
-                core_count = 0
-            else:
-                core_count = min(raw_core, pos["count"]) // lot * lot if lot > 0 else 0
-            pstate["core_count"] = max(0, core_count)
-            changes.append(
-                f"{ticker}: миграция, добавлено ядро {pstate['core_count']} шт."
-            )
+        idea = idea_for_management(ticker, ideas) if ideas_available else None
 
         if pstate is None:
-            if init_position(ticker, pos, stock, state):
-                p = pos_state[ticker]
-                tradable = p["original_count"] - p["core_count"]
+            plan = build_position_plan(ticker, pos, stock, idea, today)
+            if plan:
+                pos_state[ticker] = plan
+                kind = "legacy" if plan["legacy"] else "идея ВТБ"
                 changes.append(
-                    f"{ticker}: новая, ATR={p['entry_atr']:.3f}, "
-                    f"ядро={p['core_count']}, спутник={tradable}, "
-                    f"TP1={p['targets'][0]:.3f}, Stop={p['initial_stop']:.3f}"
+                    f"{ticker}: новая позиция ({kind}), anchor={plan['plan_anchor']:.3f}, "
+                    f"стоп={plan['initial_stop']:.3f}, "
+                    f"цели={[round(x, 2) for x in plan['targets']]}"
+                )
+            else:
+                changes.append(f"{ticker}: не удалось построить план")
+            continue
+
+        pstate["current_atr"] = atr
+        pstate["peak"] = max(float(pstate.get("peak", stock["last"])),
+                             float(stock["last"]))
+
+        expected = int(pstate.get("original_count", 0)) - int(pstate.get("sold", 0))
+        count = int(pos["count"])
+        buy_changed = abs(float(pos["buy_price"]) - float(pstate.get("avg_cost", 0.0))) > 0.001
+
+        # Частичная продажа уже рекомендована, но пользователь ещё не обновил файл.
+        # Это не докупка: не переинициализируем план и не считаем позицию новой.
+        pending_sell = int(pstate.get("pending_sell_shares", 0) or 0)
+        if pending_sell > 0 and not buy_changed:
+            if count <= expected:
+                pstate["pending_sell_shares"] = 0
+            elif count <= expected + pending_sell:
+                continue
+            else:
+                pstate["pending_sell_shares"] = 0
+
+        # Позиция уже полностью закрыта сигналом, но пользователь ещё не обновил файл.
+        if pstate.get("exit_alerted") and count <= max(0, expected):
+            if count < max(0, expected):
+                pstate["sold"] = int(pstate["original_count"]) - count
+                pstate["stage"] = _stage_from_sold(pstate.get("levels", []),
+                                                   int(pstate["sold"]))
+                changes.append(f"{ticker}: ручная продажа после exit, "
+                               f"sold={pstate['sold']}")
+            continue
+
+        if count > expected or buy_changed:
+            old = (f"было count={expected}, buy={pstate.get('avg_cost')}, "
+                   f"sold={pstate.get('sold')}")
+            plan = build_position_plan(ticker, pos, stock, idea, today)
+            if plan:
+                pos_state[ticker] = plan
+                reason = "докупка" if count > expected else "смена buy_price"
+                changes.append(
+                    f"{ticker}: переинициализация ({reason}) [{old}] → "
+                    f"count={count}, buy={pos['buy_price']:.3f}, "
+                    f"anchor={plan['plan_anchor']:.3f}"
                 )
             continue
 
-        original = pstate.get("original_count", 0)
-        sold = pstate.get("sold", 0)
-        stored_buy = pstate.get("buy_price", 0.0)
-        stored_core = pstate.get("core_count", 0)
-        expected_remaining = original - sold
-
-        count_diff = pos["count"] - expected_remaining
-        buy_changed = abs(pos["buy_price"] - stored_buy) > 0.001
-
-        # Пользователь нарушил ядро (count < core_count) — форсированная переинициализация
-        user_broke_core = (pos["count"] < stored_core)
-
-        # Если пользователь изменил core_count в portfolio.json — переинициализация
-        new_core_from_file = pos.get("core_count", stored_core)
-        if ticker in GOLD_TICKERS:
-            new_core_from_file = 0
-        else:
-            new_core_from_file = min(new_core_from_file, pos["count"]) // lot * lot if lot > 0 else 0
-        core_changed = (new_core_from_file != stored_core)
-
-        if buy_changed or count_diff > 0 or user_broke_core or core_changed:
-            old_desc = (f"было: count={expected_remaining}, "
-                        f"buy={stored_buy:.3f}, sold={sold}, core={stored_core}")
-            if init_position(ticker, pos, stock, state):
-                state["notified_profit"] = [
-                    k for k in state["notified_profit"]
-                    if not k.startswith(f"{ticker}_")
-                ]
-                state["notified_stop"] = [
-                    k for k in state["notified_stop"]
-                    if not k.startswith(f"{ticker}_")
-                ]
-                state["notified_buffett"] = [
-                    k for k in state.get("notified_buffett", [])
-                    if not k.startswith(f"{ticker}_")
-                ]
-                p = pos_state[ticker]
-                reason = []
-                if buy_changed: reason.append("смена buy_price")
-                if count_diff > 0: reason.append("докупка")
-                if user_broke_core: reason.append("ядро нарушено вручную")
-                if core_changed: reason.append("изменён core_count")
-                changes.append(
-                    f"{ticker}: переинициализация ({'; '.join(reason)}) "
-                    f"[{old_desc}] → count={pos['count']}, "
-                    f"core={p['core_count']}, "
-                    f"buy={pos['buy_price']:.3f}, ATR={p['entry_atr']:.3f}"
-                )
-        elif count_diff < 0:
-            # Ручная продажа — увеличиваем sold, но проверяем, что не трогаем ядро
-            new_sold = original - pos["count"]
-            pstate["sold"] = new_sold
+        if count < expected:
+            pstate["sold"] = int(pstate["original_count"]) - count
+            pstate["stage"] = _stage_from_sold(pstate.get("levels", []),
+                                               int(pstate["sold"]))
             changes.append(
-                f"{ticker}: ручная продажа {abs(count_diff)} шт., "
-                f"sold={sold} → {new_sold}, остаток={pos['count']}, "
-                f"ядро={pstate['core_count']}"
+                f"{ticker}: ручная продажа {expected - count} шт., "
+                f"sold={pstate['sold']}, остаток={count}"
             )
+
+        if not ideas_available:
+            continue
+
+        if pstate.get("legacy") and idea and ticker not in GOLD_TICKERS:
+            if int(pstate.get("sold", 0)) == 0 and not pstate.get("exit_alerted"):
+                plan = build_position_plan(ticker, pos, stock, idea, today,
+                                           anchor=float(stock["last"]))
+                if plan and not plan["legacy"]:
+                    pos_state[ticker] = plan
+                    changes.append(f"{ticker}: идея ВТБ усыновлена, план пересчитан")
+        elif not pstate.get("legacy") and idea:
+            new_target = float(idea["target"]) if idea.get("target") is not None else None
+            old_target = pstate.get("idea_target")
+            new_valid = str(idea.get("valid_until"))
+            if (new_target is not None and old_target is not None
+                    and abs(new_target - float(old_target)) > 0.001) or \
+                    new_valid != pstate.get("valid_until"):
+                lot = int(stock.get("lot_size", 1) or 1)
+                if update_idea_plan(pstate, idea, lot):
+                    changes.append(
+                        f"{ticker}: идея обновлена, target={new_target}, "
+                        f"valid_until={new_valid}, stage={pstate['stage']}"
+                    )
+                else:
+                    changes.append(
+                        f"{ticker}: новая цель не проходит MIN_RR — thesis exit"
+                    )
 
     return changes
 
 
 # ==============================================================================
-# 8. АКЦИИ: TP и стоп
+# 13. ВЫХОДЫ
 # ==============================================================================
 
-def _tp_trigger_price(stock: dict) -> float:
-    """Для TP-триггера — max(LAST, BID): если BID выше цели, ты можешь продать."""
-    return max(stock["last"], stock.get("bid", stock["last"]))
+def _executable_sell_price(stock: dict) -> float:
+    bid = float(stock.get("bid", stock["last"]) or stock["last"])
+    last = float(stock["last"])
+    return min(last, bid)
 
 
-def evaluate_profit_taking(ticker: str, pos: dict, stock: dict, state: dict) -> Optional[dict]:
-    if ticker in GOLD_TICKERS:
-        return None
-    pstate = state["positions"].get(ticker)
-    if not pstate:
-        return None
-    price = _tp_trigger_price(stock)
-    lot = stock["lot_size"]
+def _executable_tp_price(stock: dict) -> float:
+    bid = float(stock.get("bid", stock["last"]) or stock["last"])
+    return max(float(stock["last"]), bid)
+
+
+def _stop_reason(pstate: dict, stop: float, chandelier: float) -> str:
+    r = float(pstate.get("risk_per_share", 0.0) or 0.0)
+    anchor = float(pstate.get("plan_anchor", 0.0) or 0.0)
+    stage = int(pstate.get("stage", 0) or 0)
+    plan_be = breakeven_price(anchor)
+    if abs(stop - float(pstate.get("initial_stop", 0.0))) < 1e-6:
+        return "начальный стоп"
+    if stage >= 2 and r > 0 and stop >= anchor + 1.0 * r - 1e-6:
+        return "защита прибыли 1R"
+    if stop >= plan_be - 1e-6:
+        return "безубыток с учётом издержек"
+    if abs(stop - chandelier) < 1e-6:
+        return "Chandelier Exit"
+    return "трейлинг-стоп"
+
+
+def _lot_aligned_shares(shares: int, lot: int) -> Tuple[int, bool]:
     if lot <= 0:
-        return None
-
-    targets = pstate["targets"]
-    original_count = pstate["original_count"]
-    core_count = pstate.get("core_count", 0)
-    tradable_count = original_count - core_count  # спутник
-    already_sold = pstate.get("sold", 0)
-
-    if tradable_count <= 0:
-        return None
-
-    cumulative_pct = 0.0
-    highest_hit = -1
-    for i, (target, lvl) in enumerate(zip(targets, TAKE_PROFIT_ATR_LEVELS)):
-        if price >= target:
-            cumulative_pct += lvl["sell_pct"]
-            highest_hit = i
-
-    if highest_hit < 0:
-        return None
-
-    # Считаем от tradable (спутника), не от всего count. Округление к ближайшему лоту:
-    target_sold = int((tradable_count * min(cumulative_pct, 0.90) / lot) + 0.5) * lot
-    shares_to_sell = target_sold - already_sold
-    if shares_to_sell < lot:
-        return None
-
-    # Максимум — остаток спутника (ядро не трогаем!)
-    remaining_tradable = max(0, pos["count"] - core_count)
-    shares_to_sell = min(shares_to_sell, remaining_tradable)
-    shares_to_sell = (shares_to_sell // lot) * lot
-    if shares_to_sell < lot:
-        return None
-
-    money = net_proceeds(shares_to_sell, price, pos["buy_price"])
-    gain_pct = (price - pos["buy_price"]) / pos["buy_price"] * 100.0
-
-    return {
-        "ticker": ticker,
-        "trigger": f"LEVEL_{highest_hit}",
-        "level_idx": highest_hit,
-        "price": price,
-        "buy_price": pos["buy_price"],
-        "gain_pct": gain_pct,
-        "entry_atr": pstate["entry_atr"],
-        "target_price": targets[highest_hit],
-        "atr_mult": TAKE_PROFIT_ATR_LEVELS[highest_hit]["atr_mult"],
-        "shares": shares_to_sell,
-        "lots": shares_to_sell // lot,
-        "sell_ratio": shares_to_sell / tradable_count * 100.0 if tradable_count > 0 else 0.0,
-        "remaining_after": pos["count"] - shares_to_sell,
-        "core_count": core_count,
-        "peak": pstate.get("peak", price),
-        **money,
-    }
+        return 0, False
+    aligned = (shares // lot) * lot
+    return aligned, aligned < shares
 
 
-def evaluate_stop_loss(ticker: str, pos: dict, stock: dict, state: dict) -> Optional[dict]:
-    if ticker in GOLD_TICKERS:
-        return None
+def evaluate_stop_loss(ticker: str, pos: dict, stock: dict,
+                       state: dict) -> Optional[dict]:
     pstate = state["positions"].get(ticker)
-    if not pstate:
+    if not pstate or pstate.get("exit_alerted"):
         return None
-    price = stock["last"]
-    atr = pstate["entry_atr"]
-    if atr <= 0:
+    stop = float(pstate.get("stop_current", 0.0) or 0.0)
+    if stop <= 0:
         return None
-
-    buy = pos["buy_price"]
-    peak = pstate.get("peak", price)
-    tp1_hit = pstate.get("tp1_hit", False)
-    core_count = pstate.get("core_count", 0)
-    lot = stock["lot_size"]
-
-    # Сколько можно продать: только спутник, ядро не трогаем, строго кратно лоту
-    shares_to_sell = ((pos["count"] - core_count) // lot) * lot
-    if shares_to_sell < lot:
-        return None  # осталось только ядро — стоп не применяется
-
-    initial_stop = pstate["initial_stop"]
-    chandelier = peak - atr * TRAILING_ATR_MULT
-
-    breakeven = None
-    pre_tp1_breakeven = None
-
-    if tp1_hit:
-        breakeven = buy + atr * BREAKEVEN_PLUS_ATR
-    elif peak >= buy + atr * PRE_TP1_PROTECT_ATR:
-        pre_tp1_breakeven = buy + atr * PRE_TP1_PROTECT_PLUS_ATR
-
-    components = [initial_stop, chandelier]
-    if breakeven is not None:
-        components.append(breakeven)
-    if pre_tp1_breakeven is not None:
-        components.append(pre_tp1_breakeven)
-    effective_stop = max(components)
-
-    if price > effective_stop:
+    price = _executable_sell_price(stock)
+    if price > stop:
         return None
 
+    count = int(pos["count"])
+    lot = int(stock.get("lot_size", 1) or 1)
+    shares, odd = _lot_aligned_shares(count, lot)
+    if shares < lot:
+        shares = count
+        odd = False
+    if shares <= 0:
+        return None
+
+    atr = float(pstate.get("current_atr", pstate.get("entry_atr", 0.0)) or 0.0)
+    trail_atr = min(float(pstate.get("entry_atr", atr) or atr), atr) if atr > 0 else 0.0
+    chandelier = float(pstate.get("peak", price)) - TRAILING_ATR_MULT * trail_atr
+    money = net_proceeds(shares, price, float(pstate.get("avg_cost", pos["buy_price"])))
     return {
         "ticker": ticker,
         "trigger": "STOP",
+        "is_final": True,
         "price": price,
-        "stop": effective_stop,
-        "initial_stop": initial_stop,
+        "stop": stop,
+        "stop_after": None,
+        "reason": _stop_reason(pstate, stop, chandelier),
         "chandelier": chandelier,
-        "breakeven": breakeven,
-        "pre_tp1_breakeven": pre_tp1_breakeven,
-        "buy_price": buy,
-        "atr": atr,
-        "shares": shares_to_sell,
-        "lots": shares_to_sell // lot,
-        "lot": lot,
-        "core_count": core_count,
-        "loss_pct": (price - buy) / buy * 100.0,
-        "peak": peak,
-    }
-
-
-# ==============================================================================
-# 9. АКЦИИ: сигнал на покупку
-# ==============================================================================
-
-def evaluate_buy_signal(stock: dict) -> Optional[dict]:
-    if stock["change_pct"] > -BUY_DAY_DROP_PCT:
-        return None
-    if stock.get("z_score", 0.0) > BUY_Z_THRESHOLD:
-        return None
-    rsi = stock.get("rsi", 50.0)
-    if rsi > BUY_RSI_THRESHOLD or rsi < 15.0:
-        return None
-    # Тренд: выше EMA(50) или долгосрочно выше SMA(200)
-    if not (stock.get("trend_up", False) or stock.get("above_sma200", False)):
-        return None
-    if stock.get("atr", 0.0) <= 0:
-        return None
-    return stock
-
-
-# ==============================================================================
-# 10. ЗОЛОТО
-# ==============================================================================
-
-def evaluate_gold_buy(stock: dict) -> Optional[dict]:
-    if not stock.get("is_gold"):
-        return None
-    if stock.get("sma200") is None or not stock.get("above_sma200", False):
-        return None
-    rsi = stock.get("rsi", 50.0)
-    if rsi > GOLD_RSI_ENTRY or rsi < GOLD_RSI_FLOOR:
-        return None
-    if stock.get("atr", 0.0) <= 0:
-        return None
-    return stock
-
-
-def evaluate_gold_sell(ticker: str, pos: dict, stock: dict, state: dict) -> Optional[dict]:
-    if ticker not in GOLD_TICKERS:
-        return None
-    pstate = state["positions"].get(ticker)
-    if not pstate:
-        return None
-
-    price = _tp_trigger_price(stock)
-    lot = stock["lot_size"]
-    if lot <= 0:
-        return None
-
-    atr = pstate.get("entry_atr", 0.0)
-    if atr <= 0:
-        return None
-
-    buy = pstate["buy_price"]
-    original = pstate["original_count"]
-    sold = pstate.get("sold", 0)
-    peak = pstate.get("peak", price)
-    tp1_hit = pstate.get("tp1_hit", False)
-
-    targets = [buy + atr * lvl["atr_mult"] for lvl in GOLD_TAKE_PROFIT_LEVELS]
-    cumulative = 0.0
-    highest = -1
-    for i, (target, lvl) in enumerate(zip(targets, GOLD_TAKE_PROFIT_LEVELS)):
-        if price >= target:
-            cumulative += lvl["sell_pct"]
-            highest = i
-
-    trigger = None
-    shares_to_sell = 0
-    level_idx = None
-
-    if highest >= 0:
-        target_sold = int(original * min(cumulative, 0.90) / lot) * lot
-        shares_to_sell = target_sold - sold
-        if shares_to_sell >= lot:
-            trigger = f"GOLD_LEVEL_{highest}"
-            level_idx = highest
-
-    if trigger is None:
-        chandelier = peak - atr * GOLD_TRAILING_ATR
-        breakeven = buy + atr * GOLD_BREAKEVEN_PLUS_ATR if tp1_hit else None
-        hard_stop = buy - atr * GOLD_STOP_ATR
-
-        components = [hard_stop, chandelier]
-        if breakeven is not None:
-            components.append(breakeven)
-        effective_stop = max(components)
-
-        if stock["last"] <= effective_stop and pos["count"] > 0:
-            trigger = "GOLD_STOP"
-            shares_to_sell = pos["count"]
-            level_idx = "STOP"
-
-    if not trigger or shares_to_sell < lot:
-        return None
-
-    shares_to_sell = min(shares_to_sell, pos["count"])
-    shares_to_sell = (shares_to_sell // lot) * lot
-    if shares_to_sell < lot:
-        return None
-
-    money = net_proceeds(shares_to_sell, price, buy)
-    gain_pct = (price - buy) / buy * 100.0
-
-    return {
-        "ticker": ticker,
-        "trigger": trigger,
-        "level_idx": level_idx,
-        "price": price,
-        "buy_price": buy,
-        "gain_pct": gain_pct,
-        "entry_atr": atr,
-        "target_price": targets[level_idx] if isinstance(level_idx, int) else None,
-        "atr_mult": GOLD_TAKE_PROFIT_LEVELS[level_idx]["atr_mult"] if isinstance(level_idx, int) else None,
-        "shares": shares_to_sell,
-        "lots": shares_to_sell // lot,
-        "sell_ratio": shares_to_sell / original * 100.0,
-        "remaining_after": pos["count"] - shares_to_sell,
-        "peak": peak,
-        "is_gold": True,
+        "avg_cost": float(pstate.get("avg_cost", pos["buy_price"])),
+        "gain_pct": (price / float(pstate.get("avg_cost", pos["buy_price"])) - 1.0) * 100.0,
+        "shares": shares,
+        "lots": shares // lot if lot > 0 else 0,
+        "lot_warning": odd,
+        "remaining_after": max(0, count - shares),
+        "levels": pstate.get("levels", []),
+        "stage": int(pstate.get("stage", 0) or 0),
+        "peak": float(pstate.get("peak", price)),
         **money,
     }
 
 
+def evaluate_thesis_exit(ticker: str, pos: dict, stock: dict, state: dict,
+                         ideas: Dict[str, dict], ideas_available: bool) -> Optional[dict]:
+    pstate = state["positions"].get(ticker)
+    if not pstate or pstate.get("exit_alerted") or pstate.get("legacy"):
+        return None
+    if not ideas_available:
+        return None
+
+    idea = idea_for_management(ticker, ideas)
+    reason = None
+    if pstate.get("idea_invalid"):
+        reason = "план идеи недействителен при текущей цене/цели"
+    elif idea is None:
+        reason = "идея удалена из ideas.json"
+    elif idea.get("target") is None:
+        reason = "у идеи отсутствует цель"
+    else:
+        anchor = float(pstate["plan_anchor"])
+        stop = float(pstate["initial_stop"])
+        r = anchor - stop
+        if r <= 0:
+            reason = "некорректный R плана"
+        else:
+            target_r = (float(idea["target"]) - anchor) / r
+            if target_r < MIN_RR:
+                reason = (f"цель ниже MIN_RR: target_r={target_r:.2f} < {MIN_RR}")
+        if reason is None and idea.get("stop") is not None:
+            try:
+                if float(idea["stop"]) >= float(stock["last"]):
+                    reason = "стоп идеи выше текущей цены"
+            except Exception:
+                pass
+
+    if reason is None:
+        return None
+
+    price = _executable_sell_price(stock)
+    count = int(pos["count"])
+    lot = int(stock.get("lot_size", 1) or 1)
+    shares, odd = _lot_aligned_shares(count, lot)
+    if shares < lot:
+        shares = count
+        odd = False
+    money = net_proceeds(shares, price, float(pstate.get("avg_cost", pos["buy_price"])))
+    return {
+        "ticker": ticker,
+        "trigger": "THESIS",
+        "is_final": True,
+        "price": price,
+        "stop": None,
+        "stop_after": None,
+        "reason": reason,
+        "avg_cost": float(pstate.get("avg_cost", pos["buy_price"])),
+        "gain_pct": (price / float(pstate.get("avg_cost", pos["buy_price"])) - 1.0) * 100.0,
+        "shares": shares,
+        "lots": shares // lot if lot > 0 else 0,
+        "lot_warning": odd,
+        "remaining_after": max(0, count - shares),
+        "levels": pstate.get("levels", []),
+        "stage": int(pstate.get("stage", 0) or 0),
+        "peak": float(pstate.get("peak", price)),
+        **money,
+    }
+
+
+def evaluate_profit_taking(ticker: str, pos: dict, stock: dict,
+                           state: dict) -> Optional[dict]:
+    pstate = state["positions"].get(ticker)
+    if not pstate or pstate.get("exit_alerted"):
+        return None
+    levels = pstate.get("levels", [])
+    if not levels:
+        return None
+
+    price = _executable_tp_price(stock)
+    sold = int(pstate.get("sold", 0) or 0)
+    selected_idx = -1
+    for i, level in enumerate(levels):
+        if price >= float(level["price"]) and int(level["cum_count"]) > sold:
+            selected_idx = i
+    if selected_idx < 0:
+        return None
+
+    level = levels[selected_idx]
+    count = int(pos["count"])
+    lot = int(stock.get("lot_size", 1) or 1)
+    is_final = bool(level.get("is_final"))
+    if is_final:
+        shares = count
+        odd = False
+    else:
+        shares = int(level["cum_count"]) - sold
+        shares, odd = _lot_aligned_shares(shares, lot)
+
+    if is_final:
+        aligned, odd = _lot_aligned_shares(shares, lot)
+        if aligned >= lot:
+            shares = aligned
+        elif shares > 0:
+            shares = count
+            odd = False
+    if shares <= 0:
+        return None
+    shares = min(shares, count)
+
+    pstate_after_sold = sold + shares
+    new_stage = _stage_from_sold(levels, pstate_after_sold)
+    anchor = float(pstate.get("plan_anchor", 0.0) or 0.0)
+    r = float(pstate.get("risk_per_share", 0.0) or 0.0)
+    stop_after = breakeven_price(anchor) if anchor > 0 else None
+    if stop_after is not None and new_stage >= 1:
+        stop_after = max(stop_after, anchor + PRE_TP1_LOCK_R * r)
+    if stop_after is not None and new_stage >= 2:
+        stop_after = max(stop_after, anchor + 1.0 * r)
+
+    avg_cost = float(pstate.get("avg_cost", pos["buy_price"]))
+    money = net_proceeds(shares, price, avg_cost)
+    return {
+        "ticker": ticker,
+        "trigger": str(level["name"]),
+        "level_idx": selected_idx,
+        "level_name": str(level["name"]),
+        "is_final": is_final,
+        "price": price,
+        "target_price": float(level["price"]),
+        "stop_after": stop_after,
+        "avg_cost": avg_cost,
+        "gain_pct": (price / avg_cost - 1.0) * 100.0,
+        "shares": shares,
+        "lots": shares // lot if lot > 0 else 0,
+        "lot_warning": odd,
+        "sell_ratio": (shares / count * 100.0) if count > 0 else 0.0,
+        "remaining_after": max(0, count - shares),
+        "levels": levels,
+        "new_stage": new_stage,
+        "stage": int(pstate.get("stage", 0) or 0),
+        "peak": float(pstate.get("peak", price)),
+        **money,
+    }
+
+
+def evaluate_time_exit(ticker: str, pos: dict, stock: dict, state: dict,
+                       today: date) -> Optional[dict]:
+    pstate = state["positions"].get(ticker)
+    if not pstate or pstate.get("exit_alerted"):
+        return None
+    opened = _parse_iso_date(pstate.get("opened_at"))
+    if opened is None:
+        return None
+
+    reason = None
+    if pstate.get("legacy"):
+        limit = opened + timedelta(days=MAX_LEGACY_HOLDING_DAYS)
+        if today >= limit:
+            reason = f"legacy wind-down: {MAX_LEGACY_HOLDING_DAYS} дн. с миграции"
+    else:
+        valid_until = _parse_iso_date(pstate.get("valid_until"))
+        if valid_until is None:
+            return None
+        limit = valid_until + timedelta(days=TIME_EXIT_GRACE_DAYS)
+        if today >= limit:
+            reason = (f"истёк горизонт идеи: valid_until={valid_until.isoformat()} "
+                      f"+ {TIME_EXIT_GRACE_DAYS} дн.")
+
+    if reason is None:
+        return None
+
+    price = _executable_sell_price(stock)
+    count = int(pos["count"])
+    lot = int(stock.get("lot_size", 1) or 1)
+    shares, odd = _lot_aligned_shares(count, lot)
+    if shares < lot:
+        shares = count
+        odd = False
+    avg_cost = float(pstate.get("avg_cost", pos["buy_price"]))
+    money = net_proceeds(shares, price, avg_cost)
+    return {
+        "ticker": ticker,
+        "trigger": "TIME",
+        "is_final": True,
+        "price": price,
+        "stop": None,
+        "stop_after": None,
+        "reason": reason,
+        "avg_cost": avg_cost,
+        "gain_pct": (price / avg_cost - 1.0) * 100.0,
+        "shares": shares,
+        "lots": shares // lot if lot > 0 else 0,
+        "lot_warning": odd,
+        "remaining_after": max(0, count - shares),
+        "levels": pstate.get("levels", []),
+        "stage": int(pstate.get("stage", 0) or 0),
+        "peak": float(pstate.get("peak", price)),
+        **money,
+    }
+
+
+def update_position_stops(state: dict, tracked: Dict[str, dict]) -> None:
+    for ticker, pstate in state.get("positions", {}).items():
+        stock = tracked.get(ticker)
+        if not stock or pstate.get("exit_alerted"):
+            continue
+        anchor = float(pstate.get("plan_anchor", 0.0) or 0.0)
+        r = float(pstate.get("risk_per_share", 0.0) or 0.0)
+        if anchor <= 0 or r <= 0:
+            continue
+        entry_atr = float(pstate.get("entry_atr", 0.0) or 0.0)
+        curr_atr = float(pstate.get("current_atr", entry_atr) or entry_atr)
+        trail_atr = min(entry_atr, curr_atr) if entry_atr > 0 and curr_atr > 0 else entry_atr
+        peak = float(pstate.get("peak", stock["last"]))
+        chandelier = peak - TRAILING_ATR_MULT * trail_atr
+        stage = int(pstate.get("stage", 0) or 0)
+        components = [float(pstate.get("initial_stop", 0.0)),
+                      float(pstate.get("stop_current", 0.0)),
+                      chandelier]
+        if stage >= 1:
+            components.append(breakeven_price(anchor))
+            components.append(anchor + PRE_TP1_LOCK_R * r)
+        if stage >= 2:
+            components.append(anchor + 1.0 * r)
+        if stage == 0 and peak >= anchor + PRE_TP1_TRIGGER_R * r:
+            components.append(anchor + PRE_TP1_LOCK_R * r)
+        new_stop = max(components)
+        pstate["stop_current"] = max(float(pstate.get("stop_current", 0.0)), new_stop)
+
+
 # ==============================================================================
-# 11. TELEGRAM
+# 14. ВХОД
 # ==============================================================================
 
-def send_telegram_message(html_text: str) -> bool:
-    if is_test_mode():
-        print(f"\n[TELEGRAM ТЕСТ — токен не задан]\n{_strip_html(html_text)}\n"
-              + "-" * 60)
-        return True
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": html_text, "parse_mode": "HTML"}
+def _available_metric_count(fund: dict) -> int:
+    metrics = ("pe", "pb", "ev_ebitda", "roe", "fcf_yield",
+               "net_debt_ebitda", "eps_growth", "revenue_growth")
+    return sum(1 for m in metrics if fund.get(m) is not None)
+
+
+def _timing_ok(stock: dict) -> Tuple[bool, str]:
+    rsi = float(stock.get("rsi", 50.0))
+    last = float(stock["last"])
+    if not stock.get("trend_ok", False):
+        return False, "тренд сломан (ниже SMA200/SMA50)"
+    if rsi > BUY_RSI_MAX:
+        return False, f"RSI={rsi:.1f} > {BUY_RSI_MAX}"
+    if rsi < 25.0 and not (stock.get("above_sma200") and float(stock.get("change_pct", 0)) > -5.0):
+        return False, f"RSI={rsi:.1f} — падающий нож"
+    if float(stock.get("z20", 0.0)) > BUY_Z_MAX:
+        return False, f"z20={stock.get('z20', 0):.2f} > {BUY_Z_MAX}"
+    if float(stock.get("atr_pct", 0.0)) > MAX_ATR_PCT:
+        return False, f"ATR%={stock.get('atr_pct', 0):.2f} > {MAX_ATR_PCT}"
+    if last <= 0:
+        return False, "нет цены"
+    return True, ""
+
+
+def evaluate_entry(ticker: str, stock: dict, idea: dict, fund: dict,
+                   fundamentals_all: Dict[str, dict],
+                   state: dict, portfolio: Dict[str, dict], tracked: Dict[str, dict],
+                   cash: float, equity: float, screen_map: Dict[str, dict],
+                   fundamentals_stale_days: Optional[int],
+                   today: date) -> Tuple[Optional[dict], List[str]]:
+    reasons: List[str] = []
+    if ticker in portfolio:
+        return None, ["позиция уже есть"]
+    if ticker in state.get("pending_entries", {}):
+        return None, ["сигнал уже отправлен сегодня"]
+    if ticker in GOLD_TICKERS:
+        return None, ["золото — только legacy"]
+
+    last = float(stock["last"])
+    ask = float(stock.get("ask", last) or last)
+    entry_exec = max(last, ask)
     try:
-        r = requests.post(url, json=payload, timeout=10)
-        r.raise_for_status()
-        return True
-    except requests.RequestException as e:
-        err_msg = str(e)
-        if hasattr(e, "response") and e.response is not None:
-            err_msg += f" | {e.response.text}"
-        print(f"[ОШИБКА TELEGRAM] {err_msg}")
-        return False
+        entry_low = float(idea["entry_low"])
+        entry_high = float(idea["entry_high"])
+        target = float(idea["target"])
+    except Exception:
+        return None, ["некорректные цены идеи"]
+
+    if last < entry_low or last > entry_high:
+        return None, [f"цена {last:.2f} вне зоны {entry_low:.2f}–{entry_high:.2f}"]
+
+    atr = float(stock.get("atr", 0.0) or 0.0)
+    if atr <= 0:
+        return None, ["ATR=0"]
+    if float(stock.get("atr_pct", 0.0)) > MAX_ATR_PCT:
+        return None, [f"ATR%={stock.get('atr_pct', 0):.2f} > {MAX_ATR_PCT}"]
+
+    stop = initial_stop_for_idea(idea, entry_exec, atr)
+    if stop is None:
+        return None, ["стоп не проходит лимит риска/структуры"]
+
+    p = bayesian_win_rate(state.get("stats", {}))
+    exp = trade_expectancy(entry_exec, stop, target, p)
+    if exp is None:
+        return None, ["некорректная цель/стоп"]
+    if exp["target_r"] < MIN_RR:
+        return None, [f"target_r={exp['target_r']:.2f} < {MIN_RR}"]
+    if exp["upside_pct"] < MIN_UPSIDE_PCT:
+        return None, [f"upside={exp['upside_pct']:.2f}% < {MIN_UPSIDE_PCT}%"]
+    if exp["expectancy_r"] < MIN_EXPECTANCY_R:
+        return None, [f"E_R={exp['expectancy_r']:.3f} < {MIN_EXPECTANCY_R}"]
+
+    timing_ok, timing_reason = _timing_ok(stock)
+    if not timing_ok:
+        return None, [timing_reason]
+
+    adv = float(stock.get("avg_value_20", 0.0) or stock.get("volume", 0.0) or 0.0)
+    if adv < MIN_DAILY_VOLUME:
+        return None, [f"ADV={adv:,.0f} < {MIN_DAILY_VOLUME:,.0f}"]
+    if int(stock.get("listing_level", 1) or 1) > 2:
+        return None, ["уровень листинга > 2"]
+
+    if not fund:
+        return None, ["нет fundamentals"]
+    if _available_metric_count(fund) < 2:
+        return None, ["в fundamentals меньше 2 метрик"]
+    if fundamentals_stale_days is None:
+        return None, ["fundamentals без _meta.updated — запустите --migrate"]
+    if fundamentals_stale_days > FUNDAMENTALS_HARD_STALE_DAYS:
+        return None, [f"fundamentals устарели на {fundamentals_stale_days} дн."]
+
+    sector = normalize_sector(fund.get("sector", "Прочее"))
+    roe = fund.get("roe")
+    if roe is not None and float(roe) < 0:
+        return None, [f"ROE={roe} < 0"]
+    debt = fund.get("net_debt_ebitda")
+    if debt is not None and sector != "Банки" and float(debt) > 3.0:
+        return None, [f"NetDebt/EBITDA={debt} > 3.0"]
+    if fund.get("fcf_positive") is False:
+        return None, ["FCF отрицательный"]
+
+    screen_row = screen_map.get(ticker)
+    if not screen_row:
+        return None, ["тикер отсутствует в скринере"]
+    if float(screen_row.get("score", -999.0)) < 0.0:
+        return None, [f"score={screen_row.get('score', 0):+.2f} < 0"]
+
+    values = position_values(portfolio, tracked)
+    open_heat = open_portfolio_heat(state, portfolio, tracked)
+    sector_value = sector_exposure(portfolio, tracked, fundamentals_all, sector)
+    returns_map = {t: tracked[t].get("returns_60", []) for t in values if t in tracked}
+    candidate_returns = stock.get("returns_60", [])
+    cluster_value, max_corr, _ = correlation_cluster(candidate_returns, values, returns_map)
+    if max_corr == 0.0:
+        cluster_value = sector_value
+
+    pending = state.get("pending_entries", {})
+    pending_sector_value = sum(float(p.get("value", 0.0)) for p in pending.values()
+                               if p.get("sector") == sector)
+    pending_value = pending_sector_value
+    pending_risk = sum(float(p.get("risk", 0.0)) for p in pending.values())
+    n_pending = len(pending)
+
+    shares, sizing = plan_entry_size(
+        anchor=entry_exec, stop=stop, target=target, p=p,
+        equity=equity, cash=cash, adv=adv,
+        lot=int(stock.get("lot_size", 1) or 1),
+        sector_value=sector_value, cluster_value=cluster_value,
+        open_risk=open_heat, pending_value=pending_value,
+        pending_risk=pending_risk,
+        n_positions=len(portfolio), n_pending=n_pending,
+    )
+    if shares <= 0:
+        return None, [sizing.get("reason", "размер 0")]
+
+    # Volatility targeting: консервативно учитываем pending как rho=1.
+    candidate_value = sizing["value"]
+    values_after = dict(values)
+    returns_after = dict(returns_map)
+    values_after[ticker] = candidate_value
+    returns_after[ticker] = candidate_returns
+    sigma = portfolio_volatility(values_after, returns_after, equity)
+    if sigma > MAX_PORTFOLIO_VOL_PCT and sigma > 0:
+        scale = MAX_PORTFOLIO_VOL_PCT / sigma
+        lot = int(stock.get("lot_size", 1) or 1)
+        shares = int(shares * scale // lot) * lot
+        if shares <= 0:
+            return None, [f"portfolio vol {sigma*100:.1f}% > лимита"]
+        sizing["shares"] = shares
+        sizing["value"] = shares * entry_exec
+        sizing["risk_rub"] = shares * (entry_exec - stop)
+        sizing["risk_pct_equity"] = sizing["risk_rub"] / equity * 100.0
+        sizing["position_pct_equity"] = sizing["value"] / equity * 100.0
+        candidate_value = sizing["value"]
+        sigma = portfolio_volatility(
+            {**values, ticker: candidate_value},
+            {**returns_map, ticker: candidate_returns},
+            equity,
+        )
+
+    levels = build_levels(entry_exec, stop, target, shares,
+                          int(stock.get("lot_size", 1) or 1))
+    if not levels:
+        return None, ["ладдер не построен"]
+
+    heat_after = (open_heat + pending_risk + sizing["risk_rub"]) / equity * 100.0
+    sector_after = (sector_value + pending_sector_value + candidate_value) / equity * 100.0
+    return {
+        "ticker": ticker,
+        "idea": idea,
+        "stock": stock,
+        "fund": fund,
+        "sector": sector,
+        "entry_low": entry_low,
+        "entry_high": entry_high,
+        "entry_exec": entry_exec,
+        "last": last,
+        "ask": ask,
+        "target": target,
+        "stop": stop,
+        "R": exp["R"],
+        "target_r": exp["target_r"],
+        "upside_pct": exp["upside_pct"],
+        "risk_pct": exp["risk_pct"],
+        "p": p,
+        "expectancy_r": exp["expectancy_r"],
+        "shares": shares,
+        "lots": shares // int(stock.get("lot_size", 1) or 1),
+        "value": sizing["value"],
+        "risk_rub": sizing["risk_rub"],
+        "risk_pct_equity": sizing["risk_pct_equity"],
+        "position_pct_equity": sizing["position_pct_equity"],
+        "levels": levels,
+        "heat_after": heat_after,
+        "sector_after": sector_after,
+        "max_corr": max_corr,
+        "portfolio_vol_after": sigma * 100.0,
+        "score": float(screen_row.get("score", 0.0)),
+        "screen_row": screen_row,
+        "today": today,
+    }, reasons
 
 
 # ==============================================================================
-# 12. ФОРМАТИРОВАНИЕ
+# 15. СКРИНЕР
 # ==============================================================================
+
+VALUE_METRICS = ("ep", "bp", "fcf_yield", "ebitda_yield")
+QUALITY_METRICS = ("roe", "neg_debt", "fcf_pos", "earnings_stability")
+GROWTH_METRICS = ("eps_growth", "revenue_growth")
+MOMENTUM_METRICS = ("mom_12_1", "rel_strength_6_1", "trend")
+RISK_METRICS = ("neg_vol60", "neg_max_dd", "neg_beta")
+ALL_METRICS = (VALUE_METRICS + QUALITY_METRICS + GROWTH_METRICS
+               + MOMENTUM_METRICS + RISK_METRICS + ("idea_expectancy",))
+
+
+def _factor_score(z_map: Dict[str, Dict[str, float]], metrics: tuple,
+                  ticker: str) -> Tuple[float, float]:
+    values = []
+    for metric in metrics:
+        value = z_map.get(metric, {}).get(ticker)
+        if value is not None:
+            values.append(value)
+    if not values:
+        return 0.0, 0.0
+    return sum(values) / len(values), len(values) / len(metrics)
+
+
+def build_screen_map(stocks: Dict[str, dict], fundamentals: Dict[str, dict],
+                     ideas: Dict[str, dict], portfolio: Dict[str, dict],
+                     state: dict, index_closes: Optional[List[float]],
+                     today: date) -> Tuple[Dict[str, dict], List[dict], List[str]]:
+    warnings: List[str] = []
+    universe = set(fundamentals) | set(portfolio)
+    universe |= active_idea_tickers(ideas, today)
+    universe -= GOLD_TICKERS
+
+    rows: List[dict] = []
+    p = bayesian_win_rate(state.get("stats", {}))
+    index_mom_6_1 = _momentum(index_closes or [], 126, 21)
+    for ticker in sorted(universe):
+        stock = stocks.get(ticker)
+        if not stock or float(stock.get("atr", 0.0) or 0.0) <= 0:
+            continue
+        fund = fundamentals.get(ticker, {})
+        idea = active_idea_for(ticker, ideas, today)
+        last = float(stock["last"])
+        ask = float(stock.get("ask", last) or last)
+        anchor = max(last, ask)
+
+        ep = None
+        if fund.get("pe") is not None and float(fund["pe"]) > 0:
+            ep = 1.0 / float(fund["pe"])
+        bp = None
+        if fund.get("pb") is not None and float(fund["pb"]) > 0:
+            bp = 1.0 / float(fund["pb"])
+        ebitda_yield = None
+        if fund.get("ev_ebitda") is not None and float(fund["ev_ebitda"]) > 0:
+            ebitda_yield = 1.0 / float(fund["ev_ebitda"])
+
+        stop = None
+        target_r = None
+        expectancy_r = None
+        if idea is not None:
+            stop = initial_stop_for_idea(idea, anchor, float(stock["atr"]))
+            if stop is not None:
+                exp = trade_expectancy(anchor, stop, float(idea["target"]), p)
+                if exp:
+                    target_r = exp["target_r"]
+                    expectancy_r = exp["expectancy_r"]
+
+        row = {
+            "ticker": ticker,
+            "name": fund.get("name", stock.get("name", ticker)),
+            "sector": normalize_sector(fund.get("sector", "Прочее")),
+            "price": last,
+            "has_idea": idea is not None,
+            "idea_target": float(idea["target"]) if idea and idea.get("target") else None,
+            "target_r": target_r,
+            "expectancy_r": expectancy_r,
+            "ep": ep,
+            "bp": bp,
+            "fcf_yield": fund.get("fcf_yield"),
+            "ebitda_yield": ebitda_yield,
+            "roe": fund.get("roe"),
+            "neg_debt": (-float(fund["net_debt_ebitda"])
+                         if fund.get("net_debt_ebitda") is not None else None),
+            "fcf_pos": (1.0 if fund.get("fcf_positive") else 0.0
+                        if fund.get("fcf_positive") is not None else None),
+            "earnings_stability": fund.get("earnings_stability"),
+            "eps_growth": fund.get("eps_growth"),
+            "revenue_growth": fund.get("revenue_growth"),
+            "mom_12_1": stock.get("momentum_12_1"),
+            "rel_strength_6_1": float(stock.get("momentum_6_1", 0.0)) - index_mom_6_1,
+            "trend": 1.0 if stock.get("trend_ok") else 0.0,
+            "neg_vol60": -float(stock.get("vol60", 0.0)),
+            "neg_max_dd": -float(stock.get("max_dd_252", 0.0)),
+            "neg_beta": -float(stock.get("beta", 1.0)),
+            "idea_expectancy": expectancy_r,
+            "adv": float(stock.get("avg_value_20", 0.0) or stock.get("volume", 0.0)),
+            "atr_pct": float(stock.get("atr_pct", 0.0)),
+            "listing_level": int(stock.get("listing_level", 1) or 1),
+            "change_pct": float(stock.get("change_pct", 0.0)),
+            "rsi": float(stock.get("rsi", 50.0)),
+            "z20": float(stock.get("z20", 0.0)),
+        }
+        rows.append(row)
+
+    if len(rows) < MIN_SCREEN_TICKERS:
+        warnings.append(
+            f"скринер: только {len(rows)} тикеров, нужно >= {MIN_SCREEN_TICKERS}; "
+            f"новые входы будут заблокированы"
+        )
+
+    z_map: Dict[str, Dict[str, float]] = {}
+    for metric in ALL_METRICS:
+        z_map[metric] = _robust_z_map(rows, metric)
+
+    screen_map: Dict[str, dict] = {}
+    for row in rows:
+        ticker = row["ticker"]
+        value_score, value_complete = _factor_score(z_map, VALUE_METRICS, ticker)
+        quality_score, quality_complete = _factor_score(z_map, QUALITY_METRICS, ticker)
+        growth_score, growth_complete = _factor_score(z_map, GROWTH_METRICS, ticker)
+        momentum_score, momentum_complete = _factor_score(z_map, MOMENTUM_METRICS, ticker)
+        risk_score, risk_complete = _factor_score(z_map, RISK_METRICS, ticker)
+        idea_score, idea_complete = _factor_score(z_map, ("idea_expectancy",), ticker)
+        score = (WEIGHT_VALUE * value_score
+                 + WEIGHT_QUALITY * quality_score
+                 + WEIGHT_GROWTH * growth_score
+                 + WEIGHT_MOMENTUM * momentum_score
+                 + WEIGHT_RISK * risk_score
+                 + WEIGHT_IDEA * idea_score)
+        row.update({
+            "value_score": value_score,
+            "quality_score": quality_score,
+            "growth_score": growth_score,
+            "momentum_score": momentum_score,
+            "risk_score": risk_score,
+            "idea_score": idea_score,
+            "score": score,
+            "completeness": (value_complete + quality_complete + growth_complete
+                             + momentum_complete + risk_complete + idea_complete) / 6.0,
+        })
+
+        quality_ok = True
+        if row["roe"] is not None and float(row["roe"]) < 0:
+            quality_ok = False
+        if (row["neg_debt"] is not None and row["sector"] != "Банки"
+                and -float(row["neg_debt"]) > 3.0):
+            quality_ok = False
+        if row["fcf_pos"] == 0.0:
+            quality_ok = False
+
+        value_trap_ok = (quality_score + momentum_score) >= 0.0
+        risk_ok = row["atr_pct"] <= MAX_ATR_PCT and row["neg_vol60"] > -0.60
+        liquidity_ok = row["adv"] >= MIN_DAILY_VOLUME and row["listing_level"] <= 2
+        timing_ok = bool(
+            row["trend"] > 0
+            and 25.0 <= float(row.get("rsi", 50.0)) <= BUY_RSI_MAX
+            and float(row.get("z20", 0.0)) <= BUY_Z_MAX
+        )
+        idea_ok = (row["has_idea"] and row["target_r"] is not None
+                   and row["target_r"] >= MIN_RR
+                   and row["expectancy_r"] is not None
+                   and row["expectancy_r"] >= MIN_EXPECTANCY_R)
+        all_gates = (quality_ok and value_trap_ok and risk_ok and liquidity_ok
+                     and timing_ok and idea_ok and score >= 0.0)
+        if all_gates:
+            verdict = "BUY NOW"
+        elif row["has_idea"] and score >= 0.0 and idea_ok:
+            verdict = "WATCH"
+        elif score >= 0.0 and quality_ok and risk_ok and liquidity_ok:
+            verdict = "SCREEN ONLY"
+        else:
+            verdict = "AVOID"
+        row["verdict"] = verdict
+        row["gates_ok"] = all_gates
+        screen_map[ticker] = row
+
+    rows.sort(key=lambda r: float(r.get("score", 0.0)), reverse=True)
+    return screen_map, rows, warnings
+
+
+# ==============================================================================
+# 16. ФОРМАТИРОВАНИЕ
+# ==============================================================================
+
+def _fmt_money(value: float) -> str:
+    return f"{value:,.2f}".replace(",", " ")
+
+
+def format_entry_message(plan: dict) -> str:
+    idea = plan["idea"]
+    stock = plan["stock"]
+    fund = plan["fund"]
+    name = html.escape(str(fund.get("name", stock.get("name", plan["ticker"]))))
+    thesis = html.escape(str(idea.get("thesis", "") or ""))
+    thesis_line = f"\n📝 {thesis}\n" if thesis else ""
+    levels = plan["levels"]
+    ladder_lines = "\n".join(
+        f"• {lvl['name']}: {lvl['price']:.2f} ₽ "
+        f"({lvl['cum_pct']*100:.0f}% позиции)"
+        for lvl in levels
+    )
+    return (
+        f"🟢 <b>СИГНАЛ НА ПОКУПКУ — {plan['ticker']} ({name})</b>\n"
+        f"Идея ВТБ: {idea.get('published')} → {idea.get('valid_until')}, "
+        f"уверенность {idea.get('conviction')}/5\n"
+        f"Зона входа: {plan['entry_low']:.2f}–{plan['entry_high']:.2f} ₽ | "
+        f"Цена: {plan['last']:.2f} ₽ | Исполнение: {plan['entry_exec']:.2f} ₽\n"
+        f"Цель: {plan['target']:.2f} ₽ (+{plan['upside_pct']:.2f}%)\n"
+        f"Стоп: {plan['stop']:.2f} ₽ (−{plan['risk_pct']:.2f}%, "
+        f"{plan['risk_pct']/max(stock.get('atr_pct', 0.01), 0.01):.2f} ATR)\n"
+        f"R: {plan['R']:.2f} ₽ | R:R: {plan['target_r']:.2f}\n"
+        f"p(win): {plan['p']:.2f} | E_R: {plan['expectancy_r']:+.2f} "
+        f"(после комиссий, slippage и НДФЛ)\n"
+        f"Скор скринера: {plan['score']:+.2f}\n"
+        f"{thesis_line}\n"
+        f"<b>Размер:</b> {plan['lots']} лот. ({plan['shares']} шт., "
+        f"{_fmt_money(plan['value'])} ₽, {plan['position_pct_equity']:.1f}% капитала)\n"
+        f"Риск: {_fmt_money(plan['risk_rub'])} ₽ "
+        f"({plan['risk_pct_equity']:.2f}% капитала) | "
+        f"Heat после: {plan['heat_after']:.1f}%\n"
+        f"Сектор после: {plan['sector_after']:.1f}% | "
+        f"Макс. corr: {plan['max_corr']:.2f} | "
+        f"Vol портфеля: {plan['portfolio_vol_after']:.1f}%\n\n"
+        f"<b>План ладдера:</b>\n{ladder_lines}\n\n"
+        f"⚠️ Обновите portfolio.json после исполнения."
+    )
+
 
 def format_profit_message(p: dict) -> str:
-    level_names = {0: "TP1", 1: "TP2", 2: "TP3"}
-    name = level_names.get(p["level_idx"], "TP")
-    core = p.get("core_count", 0)
-    core_line = f"🏛️ Ядро {core} шт. остаётся\n" if core > 0 else ""
-
-    msg = (
-        f"🎯 <b>{name} — {p['ticker']}</b>\n"
-        f"Цена: {p['price']:.2f} ₽ | Покупка: {p['buy_price']:.2f} ₽ | +{p['gain_pct']:.2f}%\n"
-        f"Цель {name}: {p['atr_mult']} ATR = {p['target_price']:.2f} ₽ (ATR={p['entry_atr']:.2f})\n"
-        f"💼 Продать: <b>{p['shares']} шт.</b> ({p['lots']} лот., {p['sell_ratio']:.1f}% спутника)\n"
-        f"💵 Выручка: {p['gross']:,.2f} ₽\n"
-        f"📉 Комиссия: {p['commission']:,.2f} ₽ | Налог: {p['tax']:,.2f} ₽\n"
-        f"✅ Чистая прибыль: <b>{p['net_profit']:,.2f} ₽</b>\n"
-        f"{core_line}"
-        f"Остаток: {p['remaining_after']} шт."
-    )
-    if p["level_idx"] == 0:
-        msg += "\n🛡️ После продажи стоп переносится в безубыток."
-    return msg
-
-
-def format_gold_profit_message(p: dict) -> str:
-    if p["trigger"] == "GOLD_STOP":
-        return (
-            f"🛑 <b>СТОП-ЛОСС (золото) — {p['ticker']}</b>\n"
-            f"Цена: {p['price']:.3f} ₽ | Покупка: {p['buy_price']:.3f} ₽ | {p['gain_pct']:+.2f}%\n"
-            f"Пик: {p['peak']:.3f} ₽ | ATR={p['entry_atr']:.3f}\n"
-            f"💼 Рекомендация: <b>продать всю позицию</b> — {p['shares']} шт."
-        )
-    level_names = {0: "TP1", 1: "TP2", 2: "TP3"}
-    name = level_names.get(p["level_idx"], "TP")
+    final_line = ("🏁 Позиция закрыта полностью.\n" if p["is_final"]
+                  else f"Остаток: {p['remaining_after']} шт.\n")
+    stop_line = (f"🛡️ Стоп после: {p['stop_after']:.2f} ₽\n"
+                 if p.get("stop_after") is not None else "")
+    lot_line = ("⚠️ Остаток меньше лота — продайте вручную.\n"
+                if p.get("lot_warning") else "")
     return (
-        f"🟡 <b>{name} (золото) — {p['ticker']}</b>\n"
-        f"Цена: {p['price']:.3f} ₽ | Покупка: {p['buy_price']:.3f} ₽ | +{p['gain_pct']:.2f}%\n"
-        f"Цель {name}: {p['atr_mult']} ATR = {p['target_price']:.3f} ₽\n"
-        f"💼 Продать: <b>{p['shares']} шт.</b> ({p['lots']} лот., {p['sell_ratio']:.1f}%)\n"
-        f"💵 Выручка: {p['gross']:,.2f} ₽\n"
-        f"📉 Комиссия: {p['commission']:,.2f} ₽ | Налог: {p['tax']:,.2f} ₽\n"
-        f"✅ Чистая прибыль: <b>{p['net_profit']:,.2f} ₽</b>\n"
-        f"Остаток: {p['remaining_after']} шт."
+        f"🎯 <b>{p['level_name']} — {p['ticker']}</b>\n"
+        f"Цена: {p['price']:.2f} ₽ | Покупка: {p['avg_cost']:.2f} ₽ | "
+        f"P&L: {p['gain_pct']:+.2f}%\n"
+        f"Уровень: {p['target_price']:.2f} ₽\n"
+        f"💼 Продать: <b>{p['shares']} шт.</b> "
+        f"({p['lots']} лот., {p['sell_ratio']:.1f}% позиции)\n"
+        f"💵 Выручка: {_fmt_money(p['gross'])} ₽\n"
+        f"📉 Комиссия: {_fmt_money(p['commission'])} ₽ | "
+        f"Налог: {_fmt_money(p['tax'])} ₽\n"
+        f"✅ Чистая прибыль: <b>{_fmt_money(p['net_profit'])} ₽</b>\n"
+        f"{stop_line}{final_line}{lot_line}"
+        f"⚠️ Обновите portfolio.json после исполнения."
     )
 
 
 def format_stop_message(p: dict) -> str:
-    price = p["price"]
-    stop = p["stop"]
-    buy = p["buy_price"]
-    pre = p.get("pre_tp1_breakeven")
-    core = p.get("core_count", 0)
-
-    if pre is not None and abs(stop - pre) < 0.01:
-        base_type = f"pre-TP1 защита ({pre:.2f} ₽ = buy + {PRE_TP1_PROTECT_PLUS_ATR} ATR)"
-    elif p["breakeven"] and abs(stop - p["breakeven"]) < 0.01:
-        base_type = f"безубыток ({p['breakeven']:.2f} ₽)"
-    elif abs(stop - p["chandelier"]) < 0.01:
-        base_type = f"Chandelier Exit (пик {p['peak']:.2f} − {TRAILING_ATR_MULT} ATR)"
-    else:
-        base_type = f"начальный стоп (покупка − {INITIAL_STOP_ATR} ATR)"
-
-    breach_pct = (price - stop) / stop * 100.0 if stop > 0 else 0.0
-    is_breached = breach_pct < -0.5
-
-    if is_breached:
-        type_line = f"Тип: {base_type} — <b>ПРОБИТ</b>"
-        breach_line = (
-            f"⚠️ Цена уже ниже стопа на {abs(price - stop):.2f} ₽ "
-            f"({breach_pct:+.2f}%)\n"
-            f"Фактическое исполнение — по рынку, ~{price:.2f} ₽\n"
-        )
-    else:
-        type_line = f"Тип: {base_type}"
-        breach_line = ""
-
-    core_line = ""
-    if core > 0:
-        core_line = f"🏛️ Ядро {core} шт. остаётся (не продаётся)\n"
-
+    lot_line = ("⚠️ Остаток меньше лота — продайте вручную.\n"
+                if p.get("lot_warning") else "")
     return (
         f"🛑 <b>СТОП-ЛОСС — {p['ticker']}</b>\n"
-        f"Цена: {price:.2f} ₽ | Стоп-уровень: {stop:.2f} ₽\n"
-        f"{type_line}\n"
-        f"{breach_line}"
-        f"Покупка: {buy:.2f} ₽ | P&L: {p['loss_pct']:+.2f}%\n"
-        f"💼 Рекомендация: <b>продать спутник</b> — {p['shares']} шт. ({p.get('lots', p['shares'] // p.get('lot', 1))} лот.)\n"
-        f"{core_line}"
+        f"Цена: {p['price']:.2f} ₽ | Стоп: {p['stop']:.2f} ₽\n"
+        f"Причина: {p['reason']}\n"
+        f"Покупка: {p['avg_cost']:.2f} ₽ | P&L: {p['gain_pct']:+.2f}%\n"
+        f"💼 Продать всю позицию: <b>{p['shares']} шт.</b> "
+        f"({p['lots']} лот.)\n"
+        f"Чистый результат: {_fmt_money(p['net_profit'])} ₽\n"
+        f"{lot_line}"
+        f"⚠️ Обновите portfolio.json после исполнения."
     )
 
 
-def format_buy_message(s: dict, cash: float, total_equity: float,
-                       current_value: float = 0.0,
-                       additional_allowed: Optional[float] = None,
-                       is_reload: bool = False,
-                       core_count: int = 0) -> str:
-    price = s["last"]
-    lot = s["lot_size"]
-    atr = s["atr"]
-    lot_cost = price * lot
-
-    stop_price = price - INITIAL_STOP_ATR * atr
-    stop_pct = INITIAL_STOP_ATR * atr / price * 100.0
-
-    risk_amount = total_equity * RISK_PER_TRADE_PCT
-    position_by_risk = risk_amount / (stop_pct / 100.0) if stop_pct > 0 else 0.0
-    position_by_max = additional_allowed if additional_allowed is not None else total_equity * MAX_POSITION_PCT
-    position_by_cash = cash
-    position = min(position_by_risk, position_by_max, position_by_cash)
-
-    lots_est = int(position // lot_cost) if lot_cost > 0 else 0
-    shares_est = lots_est * lot
-
-    if is_reload:
-        header = "СИГНАЛ НА ВОССТАНОВЛЕНИЕ СПУТНИКА (RELOAD)"
-    elif current_value > 0:
-        header = "СИГНАЛ НА ДОКУПКУ (пирамидинг)"
-    else:
-        header = "СИГНАЛ НА ПОКУПКУ"
-
-    extra_info = ""
-    if is_reload:
-        extra_info = (
-            f"\n🏛️ Ядро {core_count} шт. сохраняется (спутник был ранее зафиксирован).\n"
-            f"🔄 Перезаход в спутник на откате в тренде!\n"
-            f"📊 Текущая позиция (ядро): ~{current_value:,.0f} ₽ "
-            f"({current_value / total_equity * 100:.1f}% капитала)\n"
-        )
-    elif current_value > 0:
-        extra_info = (
-            f"\n📊 Текущая позиция: ~{current_value:,.0f} ₽ "
-            f"({current_value / total_equity * 100:.1f}% капитала)\n"
-            f"📈 До лимита {MAX_POSITION_PCT*100:.0f}%: ~{additional_allowed:,.0f} ₽\n"
-        )
-
-    tp_plan_lines = "\n".join(
-        f"• TP{i+1} ({lvl['atr_mult']} ATR): {price + atr * lvl['atr_mult']:.2f} ₽"
-        for i, lvl in enumerate(TAKE_PROFIT_ATR_LEVELS)
-    )
-
-    trend_mark = "выше EMA(50)" if s.get("trend_up") else "выше SMA(200)"
-
+def format_full_exit_message(p: dict, title: str) -> str:
+    lot_line = ("⚠️ Остаток меньше лота — продайте вручную.\n"
+                if p.get("lot_warning") else "")
     return (
-        f"🟢 <b>{header} — {s['ticker']}</b>\n"
-        f"Падение за день: <b>{s['change_pct']:.2f}%</b>\n"
-        f"Z-score: {s['z_score']:+.2f} | RSI: {s['rsi']:.1f} | Тренд: {trend_mark} ✓\n"
-        f"Цена: {price:.2f} ₽ | лот: {lot} шт.\n"
-        f"ATR: {atr:.2f} ₽ ({s['atr_pct']:.2f}%)\n"
-        f"{extra_info}\n"
-        f"<b>План по ATR:</b>\n"
-        f"• Стоп ({INITIAL_STOP_ATR} ATR): {stop_price:.2f} ₽ (−{stop_pct:.2f}%)\n"
-        f"{tp_plan_lines}\n\n"
-        f"<b>Размер покупки (риск {RISK_PER_TRADE_PCT*100:.1f}% = {risk_amount:,.0f} ₽):</b>\n"
-        f"• {lots_est} лот. ({shares_est} шт., ~{shares_est * price:,.0f} ₽)"
+        f"🚪 <b>{title} — {p['ticker']}</b>\n"
+        f"Причина: {p['reason']}\n"
+        f"Цена: {p['price']:.2f} ₽ | Покупка: {p['avg_cost']:.2f} ₽ | "
+        f"P&L: {p['gain_pct']:+.2f}%\n"
+        f"💼 Продать всю позицию: <b>{p['shares']} шт.</b> "
+        f"({p['lots']} лот.)\n"
+        f"Чистый результат: {_fmt_money(p['net_profit'])} ₽\n"
+        f"{lot_line}"
+        f"⚠️ Обновите portfolio.json после исполнения."
     )
 
 
-def format_gold_buy_message(s: dict, current_value: float, additional: float,
-                            total_equity: float) -> str:
-    price = s["last"]
-    atr = s["atr"]
-    lot = s["lot_size"]
-    lot_cost = price * lot
-    lots = int(additional // lot_cost) if lot_cost > 0 else 0
-
-    stop_price = price - GOLD_STOP_ATR * atr
-    tp1 = price + atr * GOLD_TAKE_PROFIT_LEVELS[0]["atr_mult"]
-    tp2 = price + atr * GOLD_TAKE_PROFIT_LEVELS[1]["atr_mult"]
-    tp3 = price + atr * GOLD_TAKE_PROFIT_LEVELS[2]["atr_mult"]
-
-    header = "ЗОЛОТО: ДОКУПКА" if current_value > 0 else "ЗОЛОТО: ПОКУПКА"
-    pos_line = (f"\n📊 Текущая позиция: ~{current_value:,.0f} ₽ "
-                f"({current_value / total_equity * 100:.1f}% капитала)") if current_value > 0 else ""
-
+def format_risk_halt_message(cb: dict) -> str:
+    reasons = "\n".join(f"• {r}" for r in cb.get("reasons", [])) or "• лимит активен"
     return (
-        f"🟡 <b>{header} — {s['ticker']}</b>\n"
-        f"RSI: {s['rsi']:.1f} (откат в тренде) | Цена > SMA200 ✓\n"
-        f"Цена: {price:.3f} ₽ | лот: {lot} шт.\n"
-        f"ATR: {atr:.3f} ₽ ({s['atr_pct']:.2f}%)\n"
-        f"{pos_line}\n"
-        f"<b>План (трендовая логика):</b>\n"
-        f"• Стоп (3 ATR): {stop_price:.3f} ₽\n"
-        f"• TP1 (2.5 ATR): {tp1:.3f} ₽\n"
-        f"• TP2 (4.5 ATR): {tp2:.3f} ₽\n"
-        f"• TP3 (7.0 ATR): {tp3:.3f} ₽\n\n"
-        f"<b>Лимит на золото {GOLD_MAX_POSITION_PCT*100:.0f}%:</b>\n"
-        f"Доступно ~{additional:,.0f} ₽ → ~{lots} лот. (~{lots * lot} шт.)"
+        f"⚠️ <b>РИСК-СТОП: новые входы приостановлены</b>\n"
+        f"{reasons}\n"
+        f"Просадка от пика: {cb.get('drawdown', 0.0)*100:.2f}%\n"
+        f"Дневной убыток: {cb.get('daily_loss', 0.0)*100:.2f}%\n"
+        f"Выходы по стопам продолжают работать."
     )
 
 
 # ==============================================================================
-# 13. ТОРГОВЫЕ ЧАСЫ
+# 17. СДЕЛКИ И СТАТИСТИКА
+# ==============================================================================
+
+def _record_closed_trade(state: dict, ticker: str, pstate: dict, exit_price: float,
+                         exit_reason: str, today: date) -> None:
+    if pstate.get("archived"):
+        return
+    pstate["archived"] = True
+    pstate["closed_at"] = today.isoformat()
+    opened = _parse_iso_date(pstate.get("opened_at"))
+    holding_days = (today - opened).days if opened else 0
+    net_profit = float(pstate.get("realized_pnl", 0.0))
+    risk = float(pstate.get("initial_risk_rub", 0.0))
+    r_multiple = (net_profit / risk) if risk > 0 else 0.0
+    trade = {
+        "ticker": ticker,
+        "avg_cost": float(pstate.get("avg_cost", 0.0)),
+        "plan_anchor": float(pstate.get("plan_anchor", 0.0)),
+        "exit_price": float(exit_price),
+        "shares": int(pstate.get("original_count", 0)),
+        "net_profit": net_profit,
+        "r_multiple": r_multiple,
+        "reason": exit_reason,
+        "opened_at": pstate.get("opened_at"),
+        "closed_at": today.isoformat(),
+        "holding_days": holding_days,
+    }
+    stats = state.setdefault("stats", {"wins": 0, "losses": 0,
+                                       "gross_profit": 0.0, "gross_loss": 0.0})
+    if net_profit > 0:
+        stats["wins"] = int(stats.get("wins", 0)) + 1
+        stats["gross_profit"] = float(stats.get("gross_profit", 0.0)) + net_profit
+    else:
+        stats["losses"] = int(stats.get("losses", 0)) + 1
+        stats["gross_loss"] = float(stats.get("gross_loss", 0.0)) + net_profit
+    trades = state.setdefault("closed_trades", [])
+    trades.append(trade)
+    state["closed_trades"] = trades[-MAX_TRADE_LOG:]
+
+
+def apply_exit(state: dict, ticker: str, pstate: dict, plan: dict, today: date) -> None:
+    pstate["sold"] = int(pstate.get("sold", 0)) + int(plan["shares"])
+    pstate["realized_pnl"] = float(pstate.get("realized_pnl", 0.0)) + float(plan["net_profit"])
+    risk = float(pstate.get("initial_risk_rub", 0.0))
+    if risk > 0:
+        pstate["realized_r"] = float(pstate.get("realized_r", 0.0)) + float(plan["net_profit"]) / risk
+    pstate["stage"] = _stage_from_sold(pstate.get("levels", []), int(pstate["sold"]))
+    if plan.get("stop_after") is not None:
+        pstate["stop_current"] = max(float(pstate.get("stop_current", 0.0)),
+                                     float(plan["stop_after"]))
+    if plan.get("is_final"):
+        pstate["pending_sell_shares"] = 0
+        pstate["exit_alerted"] = True
+        _record_closed_trade(state, ticker, pstate, float(plan["price"]),
+                             str(plan.get("reason") or plan.get("trigger")), today)
+    else:
+        pstate["pending_sell_shares"] = (
+            int(pstate.get("pending_sell_shares", 0) or 0) + int(plan["shares"])
+        )
+
+
+def compute_trade_stats(state: dict) -> dict:
+    trades = state.get("closed_trades", [])
+    if not trades:
+        return {"count": 0}
+    wins = [t for t in trades if float(t.get("net_profit", 0.0)) > 0]
+    losses = [t for t in trades if float(t.get("net_profit", 0.0)) <= 0]
+    gross_profit = sum(float(t.get("net_profit", 0.0)) for t in wins)
+    gross_loss = sum(float(t.get("net_profit", 0.0)) for t in losses)
+    r_values = [float(t.get("r_multiple", 0.0)) for t in trades]
+    cumulative = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for r in r_values:
+        cumulative += r
+        peak = max(peak, cumulative)
+        max_dd = max(max_dd, peak - cumulative)
+    return {
+        "count": len(trades),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": len(wins) / len(trades) * 100.0,
+        "avg_r": sum(r_values) / len(r_values),
+        "expectancy_r": sum(r_values) / len(r_values),
+        "profit_factor": (gross_profit / abs(gross_loss)) if gross_loss < 0 else float("inf"),
+        "gross_profit": gross_profit,
+        "gross_loss": gross_loss,
+        "max_dd_r": max_dd,
+        "avg_holding_days": sum(int(t.get("holding_days", 0)) for t in trades) / len(trades),
+        "p_win_bayes": bayesian_win_rate(state.get("stats", {})),
+        "by_reason": _stats_by_reason(trades),
+    }
+
+
+def _stats_by_reason(trades: List[dict]) -> Dict[str, dict]:
+    result: Dict[str, dict] = {}
+    for t in trades:
+        reason = str(t.get("reason", "?"))
+        bucket = result.setdefault(reason, {"count": 0, "net_profit": 0.0, "r": 0.0})
+        bucket["count"] += 1
+        bucket["net_profit"] += float(t.get("net_profit", 0.0))
+        bucket["r"] += float(t.get("r_multiple", 0.0))
+    return result
+
+
+def print_trade_stats(state: dict, portfolio: Optional[Dict[str, dict]] = None,
+                      tracked: Optional[Dict[str, dict]] = None) -> None:
+    stats = compute_trade_stats(state)
+    print("\n" + "=" * 78)
+    print("PAPER-СТАТИСТИКА ЗАКРЫТЫХ СДЕЛОК")
+    print("=" * 78)
+    if stats.get("count", 0) == 0:
+        print("Закрытых сделок пока нет.")
+    else:
+        print(f"Сделок: {stats['count']} | Побед: {stats['wins']} | "
+              f"Поражений: {stats['losses']} | Win rate: {stats['win_rate']:.1f}%")
+        print(f"Средний R: {stats['avg_r']:+.3f} | Expectancy: "
+              f"{stats['expectancy_r']:+.3f}R | Profit factor: {stats['profit_factor']:.2f}")
+        print(f"Gross profit: {_fmt_money(stats['gross_profit'])} ₽ | "
+              f"Gross loss: {_fmt_money(stats['gross_loss'])} ₽")
+        print(f"Max drawdown по R: {stats['max_dd_r']:.2f}R | "
+              f"Средний hold: {stats['avg_holding_days']:.1f} дн.")
+        print(f"Байесовский p(win): {stats['p_win_bayes']:.3f}")
+        print("-" * 78)
+        for reason, bucket in sorted(stats["by_reason"].items()):
+            print(f"{reason:<28} n={bucket['count']:<3} "
+                  f"P&L={_fmt_money(bucket['net_profit']):>12} ₽  "
+                  f"R={bucket['r']:+.2f}")
+    if portfolio and tracked:
+        open_rows = []
+        for ticker, pos in portfolio.items():
+            pstate = state.get("positions", {}).get(ticker)
+            stock = tracked.get(ticker)
+            if not pstate or not stock:
+                continue
+            anchor = float(pstate.get("plan_anchor", 0.0))
+            r = float(pstate.get("risk_per_share", 0.0))
+            unrealized_r = ((float(stock["last"]) - anchor) / r) if r > 0 else 0.0
+            pnl = (float(stock["last"]) - float(pos["buy_price"])) * int(pos["count"])
+            open_rows.append((ticker, pnl, unrealized_r))
+        if open_rows:
+            print("-" * 78)
+            print("ОТКРЫТЫЕ ПОЗИЦИИ (unrealized):")
+            for ticker, pnl, r_mult in open_rows:
+                print(f"{ticker:<7} P&L={_fmt_money(pnl):>12} ₽  R={r_mult:+.2f}")
+    print("=" * 78 + "\n")
+
+
+# ==============================================================================
+# 18. ДАШБОРД
+# ==============================================================================
+
+def print_dashboard(portfolio: Dict[str, dict], tracked: Dict[str, dict],
+                    cash: float, state: dict) -> None:
+    print("\n" + "=" * 168)
+    print(f"{'Тикер':<6} | {'Всего':>7} | {'Покупка':>9} | {'Рынок':>9} | "
+          f"{'День%':>7} | {'Доход%':>7} | {'P&L,₽':>10} | {'ATR%':>6} | "
+          f"{'RSI':>5} | {'Стоп':>9} | {'TP1':>9} | {'TP2':>9} | {'TP3':>9} | "
+          f"{'Стадия':>6} | {'Дней':>5} | {'Статус'}")
+    print("-" * 168)
+
+    total_val = 0.0
+    total_cost = 0.0
+    today = datetime.now(MSK_TZ).date()
+    for ticker, pos in portfolio.items():
+        stock = tracked.get(ticker)
+        if not stock:
+            print(f"{ticker:<6} | {pos['count']:>7} | НЕТ ДАННЫХ")
+            continue
+        cur = float(stock["last"])
+        buy = float(pos["buy_price"])
+        cnt = int(pos["count"])
+        gain = (cur - buy) / buy * 100.0 if buy > 0 else 0.0
+        pnl = (cur - buy) * cnt
+        total_val += cur * cnt
+        total_cost += buy * cnt
+
+        pstate = state.get("positions", {}).get(ticker, {})
+        levels = pstate.get("levels", [])
+        stop = float(pstate.get("stop_current", 0.0) or 0.0)
+        tp = [float(l["price"]) for l in levels]
+        tp1 = tp[0] if len(tp) > 0 else 0.0
+        tp2 = tp[1] if len(tp) > 1 else 0.0
+        tp3 = tp[2] if len(tp) > 2 else 0.0
+        stage = int(pstate.get("stage", 0) or 0)
+        opened = _parse_iso_date(pstate.get("opened_at"))
+        hold_days = (today - opened).days if opened else 0
+        if pstate.get("exit_alerted"):
+            status = "ЖДЁТ ИСПОЛНЕНИЯ"
+        elif pstate.get("legacy"):
+            status = "LEGACY"
+        elif stage > 0:
+            status = f"TP{stage}"
+        else:
+            status = "OK"
+
+        print(f"{ticker:<6} | {cnt:>7} | {buy:>9.2f} | {cur:>9.2f} | "
+              f"{stock.get('change_pct', 0.0):>+6.2f}% | {gain:>+6.2f}% | "
+              f"{pnl:>+9.2f} | {stock.get('atr_pct', 0.0):>6.2f} | "
+              f"{stock.get('rsi', 50.0):>5.1f} | {stop:>9.2f} | "
+              f"{tp1:>9.2f} | {tp2:>9.2f} | {tp3:>9.2f} | "
+              f"{stage:>3}/{len(levels):<2} | {hold_days:>5} | {status}")
+
+    print("-" * 168)
+    total_pnl = total_val - total_cost
+    total_pnl_pct = (total_pnl / total_cost * 100.0) if total_cost > 0 else 0.0
+    print(f"Активы: {_fmt_money(total_val)} ₽ | Кэш: {_fmt_money(cash)} ₽ | "
+          f"Капитал: {_fmt_money(total_val + cash)} ₽")
+    print(f"P&L: {total_pnl:+,.2f} ₽ ({total_pnl_pct:+.2f}%)")
+    pending = state.get("pending_entries", {})
+    if pending:
+        print("-" * 168)
+        print("ОЖИДАЮТ ИСПОЛНЕНИЯ (сигналы):")
+        for ticker, p in pending.items():
+            print(f"  {ticker}: ~{_fmt_money(float(p.get('value', 0.0)))} ₽, "
+                  f"риск {_fmt_money(float(p.get('risk', 0.0)))} ₽, "
+                  f"сектор {p.get('sector')}")
+    print("=" * 168 + "\n")
+
+
+# ==============================================================================
+# 19. МИГРАЦИЯ
+# ==============================================================================
+
+def _backup_file(path: str, suffix: str) -> Optional[str]:
+    if not os.path.exists(path):
+        return None
+    backup = f"{path}.{suffix}.bak"
+    if os.path.exists(backup):
+        stamp = datetime.now(MSK_TZ).strftime("%Y%m%d%H%M%S")
+        backup = f"{path}.{suffix}.{stamp}.bak"
+    shutil.copy2(path, backup)
+    return backup
+
+
+def run_migration() -> None:
+    print("\n" + "=" * 78)
+    print("МИГРАЦИЯ v3 → v4")
+    print("=" * 78)
+
+    portfolio, cash, err = load_portfolio()
+    if err:
+        print(f"✗ {err}")
+        print("Миграция остановлена: сначала исправьте portfolio.json.")
+        return
+
+    backup_portfolio = _backup_file(PORTFOLIO_FILE, "v3")
+    new_portfolio: Dict[str, Any] = {}
+    for ticker, pos in portfolio.items():
+        new_portfolio[ticker] = {
+            "count": int(pos["count"]),
+            "buy_price": float(pos["buy_price"]),
+        }
+    new_portfolio["CASH"] = float(cash)
+    atomic_write_json(PORTFOLIO_FILE, new_portfolio)
+    print(f"✓ portfolio.json очищен от полей ядра"
+          f"{' (backup: ' + backup_portfolio + ')' if backup_portfolio else ''}")
+
+    raw_fund, fund_err = _load_json_file(FUNDAMENTALS_FILE)
+    if fund_err:
+        print(f"! {fund_err}")
+    elif isinstance(raw_fund, dict):
+        backup_fund = _backup_file(FUNDAMENTALS_FILE, "v3")
+        new_fund: Dict[str, Any] = {
+            "_meta": {"schema_version": 2,
+                      "updated": datetime.now(MSK_TZ).date().isoformat()}
+        }
+        for ticker, value in raw_fund.items():
+            if ticker == "_meta" or not isinstance(value, dict):
+                continue
+            new_fund[ticker.upper()] = _normalize_fundamental(ticker.upper(), value)
+        atomic_write_json(FUNDAMENTALS_FILE, new_fund)
+        print(f"✓ fundamentals.json переведён на схему v2"
+              f"{' (backup: ' + backup_fund + ')' if backup_fund else ''}")
+    else:
+        print("! fundamentals.json не объект, пропущен")
+
+    backup_state = _backup_file(STATE_FILE, "v3")
+    atomic_write_json(STATE_FILE, default_state())
+    print(f"✓ state.json сброшен в v4"
+          f"{' (backup: ' + backup_state + ')' if backup_state else ''}")
+
+    if not os.path.exists(IDEAS_FILE):
+        atomic_write_json(IDEAS_FILE, {
+            "_meta": {"schema_version": 1,
+                      "updated": datetime.now(MSK_TZ).date().isoformat()}
+        })
+        print("✓ ideas.json создан пустым — заполните идеями ВТБ "
+              f"(пример: {IDEAS_EXAMPLE_FILE})")
+
+    print("\nГотово. Заполните ideas.json и fundamentals.json, затем:")
+    print("  python moex_tracker.py --ideas-check")
+    print("  python moex_tracker.py")
+    print("=" * 78 + "\n")
+
+
+# ==============================================================================
+# 20. ИТЕРАЦИЯ
 # ==============================================================================
 
 def is_market_open() -> bool:
@@ -1429,99 +2911,78 @@ def is_market_open() -> bool:
     return SESSION_START <= now.time() <= SESSION_END
 
 
-# ==============================================================================
-# 14. ДАШБОРД
-# ==============================================================================
+def _candidate_priority(portfolio: Dict[str, dict], ideas: Dict[str, dict],
+                        fundamentals: Dict[str, dict], today: date) -> set:
+    priority = set(portfolio) | set(fundamentals) | set(GOLD_TICKERS)
+    priority |= active_idea_tickers(ideas, today)
+    return priority
 
-def print_dashboard(portfolio: Dict[str, dict], tracked: Dict[str, dict],
-                    cash: float, state: dict):
-    print("\n" + "=" * 148)
-    print(f"{'Тикер':<6} | {'Всего':>7} | {'Ядро':>5} | {'Спут.':>6} | "
-          f"{'Покупка':>9} | {'Рынок':>9} | {'День%':>7} | {'Доход%':>7} | "
-          f"{'P&L,₽':>9} | {'Z':>5} | {'RSI':>5} | {'Стоп':>9} | "
-          f"{'TP1':>9} | {'TP2':>9} | {'TP3':>9}")
-    print("-" * 148)
 
-    total_val = 0.0
-    total_cost = 0.0
-    for t, pos in portfolio.items():
-        st = tracked.get(t)
-        if not st:
-            print(f"{t:<6} | {pos['count']:>7} | НЕТ ДАННЫХ")
+def refresh_position_peaks(state: dict, tracked: Dict[str, dict]) -> None:
+    for ticker, pstate in state.get("positions", {}).items():
+        stock = tracked.get(ticker)
+        if not stock:
             continue
-        cur = st["last"]
-        buy = pos["buy_price"]
-        cnt = pos["count"]
-        gain = (cur - buy) / buy * 100.0 if buy > 0 else 0.0
-        pnl = (cur - buy) * cnt
-        total_val += cur * cnt
-        total_cost += buy * cnt
-
-        pstate = state["positions"].get(t, {})
-        core = pstate.get("core_count", 0)
-        tradable = cnt - core
-        stop = 0.0
-        tp1 = tp2 = tp3 = 0.0
-        if pstate:
-            peak = pstate.get("peak", cur)
-            atr = pstate.get("entry_atr", 0.0)
-            targets = pstate.get("targets", [])
-            if t in GOLD_TICKERS:
-                chand = peak - atr * GOLD_TRAILING_ATR
-                breakeven = buy + atr * GOLD_BREAKEVEN_PLUS_ATR if pstate.get("tp1_hit") else None
-                comps = [pstate.get("initial_stop", 0.0), chand]
-            else:
-                chand = peak - atr * TRAILING_ATR_MULT
-                breakeven = buy + atr * BREAKEVEN_PLUS_ATR if pstate.get("tp1_hit") else None
-                pre_tp1 = (buy + atr * PRE_TP1_PROTECT_PLUS_ATR
-                           if (not pstate.get("tp1_hit")
-                               and peak >= buy + atr * PRE_TP1_PROTECT_ATR)
-                           else None)
-                comps = [pstate.get("initial_stop", 0.0), chand]
-                if pre_tp1 is not None:
-                    comps.append(pre_tp1)
-            if breakeven is not None:
-                comps.append(breakeven)
-            stop = max(comps)
-            if len(targets) >= 3:
-                tp1, tp2, tp3 = targets[0], targets[1], targets[2]
-
-        print(f"{t:<6} | {cnt:>7} | {core:>5} | {tradable:>6} | "
-              f"{buy:>9.2f} | {cur:>9.2f} | "
-              f"{st['change_pct']:>+6.2f}% | {gain:>+6.2f}% | {pnl:>+8.2f} | "
-              f"{st.get('z_score', 0.0):>+4.2f} | {st.get('rsi', 50.0):>5.1f} | "
-              f"{stop:>9.2f} | {tp1:>9.2f} | {tp2:>9.2f} | {tp3:>9.2f}")
-
-    print("-" * 148)
-    total_pnl = total_val - total_cost
-    total_pnl_pct = (total_pnl / total_cost * 100.0) if total_cost > 0 else 0.0
-    print(f"Активы: {total_val:,.2f} ₽ | Кэш: {cash:,.2f} ₽ | Капитал: {total_val + cash:,.2f} ₽")
-    print(f"P&L: {total_pnl:+,.2f} ₽ ({total_pnl_pct:+.2f}%)")
-    print("=" * 148 + "\n")
+        # Пик по последним ценам с момента inception плана. Дневной high
+        # может быть сформирован до старта плана и не должен поднимать стоп.
+        pstate["peak"] = max(float(pstate.get("peak", stock["last"])),
+                             float(stock["last"]))
 
 
-# ==============================================================================
-# 15. ИТЕРАЦИЯ
-# ==============================================================================
+def _dispatch_full_exit(state: dict, ticker: str, pos: dict, plan: dict,
+                        title: str, kind: str) -> bool:
+    pstate = state["positions"].get(ticker)
+    if not pstate:
+        return False
+    key = f"{ticker}_{plan['trigger']}"
+    message = (format_stop_message(plan) if plan["trigger"] == "STOP"
+               else format_full_exit_message(plan, title))
+    if not dispatch_notification(key, kind, ticker, message):
+        return False
+    apply_exit(state, ticker, pstate, plan, plan["today"])
+    state.get("pending_entries", {}).pop(ticker, None)
+    return True
+
+
+def _dispatch_partial_exit(state: dict, ticker: str, plan: dict) -> bool:
+    pstate = state["positions"].get(ticker)
+    if not pstate:
+        return False
+    key = f"{ticker}_{plan['trigger']}"
+    if not dispatch_notification(key, "PROFIT", ticker, format_profit_message(plan)):
+        return False
+    apply_exit(state, ticker, pstate, plan, plan["today"])
+    return True
+
 
 def run_iteration(state: dict) -> bool:
     now = datetime.now(MSK_TZ)
     ts = now.strftime("%H:%M:%S")
+    today = now.date()
+    today_str = today.isoformat()
+    _purge_pending_entries(state, today_str)
 
-    today_str = now.strftime("%Y-%m-%d")
     if state.get("notified_date") != today_str:
         state["notified_date"] = today_str
-        state["notified_profit"] = []
         state["notified_buy"] = []
+        state["notified_profit"] = []
         state["notified_stop"] = []
-        state["notified_buffett"] = []
-        print(f"[{ts}] Новый день — история in-memory уведомлений сброшена.")
+        print(f"[{ts}] Новый день — дневные списки уведомлений сброшены.")
 
-    portfolio, cash = load_portfolio(PORTFOLIO_FILE)
+    portfolio, cash, pf_err = load_portfolio()
+    if pf_err:
+        print(f"[{ts}] [ОСТАНОВ] {pf_err}")
+        return False
 
-    print(f"[{ts}] Запрос рыночных данных MOEX...")
+    ideas, idea_warnings, ideas_available = load_ideas()
+    fundamentals, fund_warnings, fund_available, stale_days = load_fundamentals()
+    for w in idea_warnings + fund_warnings:
+        print(f"[{ts}] [ВНИМАНИЕ] {w}")
+
+    priority = _candidate_priority(portfolio, ideas, fundamentals, today)
+    print(f"[{ts}] Запрос рыночных данных MOEX ({len(priority)} приоритетных тикеров)...")
     try:
-        all_stocks, liquid = get_moex_market_data()
+        all_stocks, _ = get_moex_market_data(priority)
     except Exception as e:
         print(f"[{ts}] Ошибка получения данных: {e}")
         return False
@@ -1530,243 +2991,354 @@ def run_iteration(state: dict) -> bool:
         return False
 
     tracked: Dict[str, dict] = {}
-    for t in portfolio:
-        if t in all_stocks:
-            tracked[t] = all_stocks[t]
-        else:
-            print(f"[{ts}] [ВНИМАНИЕ] {t} нет в TQBR.")
-    for s in liquid:
-        tracked.setdefault(s["ticker"], s)
+    for ticker in priority:
+        if ticker in all_stocks:
+            tracked[ticker] = all_stocks[ticker]
+        elif ticker in portfolio:
+            print(f"[{ts}] [ВНИМАНИЕ] {ticker} нет в TQBR.")
+    for ticker in portfolio:
+        if ticker in all_stocks:
+            tracked.setdefault(ticker, all_stocks[ticker])
 
-    enrich_with_indicators(list(tracked.values()))
+    index_closes = [float(c[1]) for c in fetch_index_candles(create_moex_session())
+                    if c and c[1] is not None]
+    enrich_with_indicators(list(tracked.values()), index_closes)
 
-    changes = sync_state_with_portfolio(state, portfolio, tracked)
+    changes = sync_state_with_portfolio(
+        state, portfolio, tracked, ideas, fundamentals, ideas_available, today
+    )
     for ch in changes:
         print(f"[{ts}] [SYNC] {ch}")
 
-    # Проверка качества бизнеса по Баффету (раз в BUFFETT_AUDIT_INTERVAL_DAYS дней)
-    last_audit_str = state.get("last_buffett_audit", "")
-    need_audit = False
-    if not last_audit_str:
-        need_audit = True
-    else:
-        try:
-            last_d = datetime.strptime(last_audit_str, "%Y-%m-%d").date()
-            if (now.date() - last_d).days >= BUFFETT_AUDIT_INTERVAL_DAYS:
-                need_audit = True
-        except Exception:
-            need_audit = True
-
-    if need_audit:
-        run_buffett_audit(portfolio, tracked, state)
-        state["last_buffett_audit"] = today_str
-
-    # Обновление пиков — по текущей цене и максимуму дня (HIGH)
-    for t, st in tracked.items():
-        if t in state["positions"]:
-            cur_peak = state["positions"][t]["peak"]
-            state["positions"][t]["peak"] = max(cur_peak, st["last"], st.get("high", st["last"]))
+    equity = portfolio_equity(portfolio, tracked, cash)
+    cb = update_circuit_breaker(state, equity, today)
+    refresh_position_peaks(state, tracked)
+    update_position_stops(state, tracked)
 
     print_dashboard(portfolio, tracked, cash, state)
 
-    # ---- 1. СТОП-ЛОСС (акции) ----
-    for t, pos in portfolio.items():
-        if t in GOLD_TICKERS:
-            continue
-        st = tracked.get(t)
-        if not st or t not in state["positions"]:
-            continue
-        plan = evaluate_stop_loss(t, pos, st, state)
-        if not plan:
-            continue
-        key = f"{t}_STOP"
-        if key in state["notified_stop"]:
-            continue
-        if dispatch_notification(key, "STOP", t, format_stop_message(plan)):
-            print(f"[{ts}] [СТОП] {t}: price={st['last']:.2f} ≤ stop={plan['stop']:.2f}")
-            state["notified_stop"].append(key)
-
-    # ---- 2. ФИКСАЦИЯ ПРИБЫЛИ (акции) ----
-    for t, pos in portfolio.items():
-        if t in GOLD_TICKERS:
-            continue
-        st = tracked.get(t)
-        if not st or t not in state["positions"]:
-            continue
-        plan = evaluate_profit_taking(t, pos, st, state)
-        if not plan:
-            continue
-        key = f"{t}_{plan['trigger']}"
-        if key in state["notified_profit"]:
-            continue
-        if dispatch_notification(key, "PROFIT", t, format_profit_message(plan)):
-            print(f"[{ts}] [ФИКСАЦИЯ] {t}: {plan['trigger']}, "
-                  f"{plan['shares']} шт., чистая {plan['net_profit']:.2f} ₽")
-            state["notified_profit"].append(key)
-            state["positions"][t]["sold"] += plan["shares"]
-            state["positions"][t]["tp1_hit"] = True
-
-    # ---- 3. ЗОЛОТО: продажа ----
-    for t, pos in portfolio.items():
-        if t not in GOLD_TICKERS:
-            continue
-        st = tracked.get(t)
-        if not st or t not in state["positions"]:
-            continue
-        plan = evaluate_gold_sell(t, pos, st, state)
-        if not plan:
-            continue
-        key = f"{t}_{plan['trigger']}"
-        if key in state["notified_profit"]:
-            continue
-        if dispatch_notification(key, "GOLD", t, format_gold_profit_message(plan)):
-            print(f"[{ts}] [ЗОЛОТО] {t}: {plan['trigger']}, "
-                  f"{plan['shares']} шт., чистая {plan['net_profit']:.2f} ₽")
-            state["notified_profit"].append(key)
-            state["positions"][t]["sold"] += plan["shares"]
-            if isinstance(plan["level_idx"], int):
-                state["positions"][t]["tp1_hit"] = True
-
-    portfolio_value = sum(
-        tracked[t]["last"] * pos["count"]
-        for t, pos in portfolio.items() if t in tracked
-    )
-    total_equity = cash + portfolio_value
-
-    # ---- 4. ЗОЛОТО: покупка ----
-    for s in liquid:
-        t = s["ticker"]
-        if t not in GOLD_TICKERS:
-            continue
-        st = tracked.get(t)
-        if not st or t in state["notified_buy"]:
-            continue
-        signal = evaluate_gold_buy(st)
-        if not signal:
+    # ---- Выходы: stop -> thesis -> TP -> time ----
+    for ticker, pos in portfolio.items():
+        stock = tracked.get(ticker)
+        pstate = state["positions"].get(ticker)
+        if not stock or not pstate:
             continue
 
-        gold_current = sum(
-            tracked[g]["last"] * portfolio[g]["count"]
-            for g in GOLD_TICKERS if g in portfolio and g in tracked
+        stop_plan = evaluate_stop_loss(ticker, pos, stock, state)
+        if stop_plan:
+            stop_plan["today"] = today
+            if _dispatch_full_exit(state, ticker, pos, stop_plan, "СТОП", "STOP"):
+                print(f"[{ts}] [СТОП] {ticker}: {stop_plan['price']:.2f} ≤ "
+                      f"{stop_plan['stop']:.2f}, продано {stop_plan['shares']} шт.")
+            continue
+
+        thesis_plan = evaluate_thesis_exit(ticker, pos, stock, state,
+                                           ideas, ideas_available)
+        if thesis_plan:
+            thesis_plan["today"] = today
+            if _dispatch_full_exit(state, ticker, pos, thesis_plan,
+                                   "ИНВАЛИДАЦИЯ ИДЕИ", "THESIS"):
+                print(f"[{ts}] [THESIS] {ticker}: {thesis_plan['reason']}")
+            continue
+
+        profit_plan = evaluate_profit_taking(ticker, pos, stock, state)
+        if profit_plan:
+            profit_plan["today"] = today
+            if _dispatch_partial_exit(state, ticker, profit_plan):
+                print(f"[{ts}] [ФИКСАЦИЯ] {ticker}: {profit_plan['trigger']}, "
+                      f"{profit_plan['shares']} шт., "
+                      f"чистая {profit_plan['net_profit']:.2f} ₽")
+                continue
+
+        time_plan = evaluate_time_exit(ticker, pos, stock, state, today)
+        if time_plan:
+            time_plan["today"] = today
+            if _dispatch_full_exit(state, ticker, pos, time_plan,
+                                   "ГОРИЗОНТ ИСТЁК", "TIME"):
+                print(f"[{ts}] [TIME] {ticker}: {time_plan['reason']}")
+
+    # ---- Входы ----
+    if cb["halt"]:
+        key = f"RISK_HALT_{today_str}"
+        if state.get("notified_stop") is not None and key not in state["notified_stop"]:
+            if dispatch_notification(key, "RISK_HALT", "", format_risk_halt_message(cb)):
+                state["notified_stop"].append(key)
+                print(f"[{ts}] [РИСК-СТОП] новые входы приостановлены: "
+                      f"{'; '.join(cb['reasons']) or 'лимит активен'}")
+    elif not ideas_available:
+        print(f"[{ts}] [ВХОД] ideas.json недоступен — новые покупки отключены.")
+    elif not fund_available or stale_days is None:
+        print(f"[{ts}] [ВХОД] fundamentals.json недоступен/без даты — "
+              f"новые покупки отключены.")
+    else:
+        stock_map = {t: tracked[t] for t in tracked}
+        screen_map, screen_rows, screen_warnings = build_screen_map(
+            stock_map, fundamentals, ideas, portfolio, state, index_closes, today
         )
-        gold_max = total_equity * GOLD_MAX_POSITION_PCT
-        additional = gold_max - gold_current
-        lot_cost = st["last"] * st["lot_size"]
-        if additional < lot_cost:
-            continue
+        for w in screen_warnings:
+            print(f"[{ts}] [СКРИНЕР] {w}")
 
-        msg = format_gold_buy_message(signal, gold_current, additional, total_equity)
-        if dispatch_notification(f"{t}_BUY", "GOLD_BUY", t, msg):
-            print(f"[{ts}] [ЗОЛОТО-ПОКУПКА] {t}: RSI={st['rsi']:.1f}, "
-                  f"цена={st['last']:.3f}, доп={additional:.0f}₽")
-            state["notified_buy"].append(t)
+        candidates = []
+        for ticker in active_idea_tickers(ideas, today):
+            if ticker in portfolio or ticker in state.get("pending_entries", {}):
+                continue
+            stock = stock_map.get(ticker)
+            idea = active_idea_for(ticker, ideas, today)
+            fund = fundamentals.get(ticker)
+            if not stock or not idea or not fund:
+                continue
+            plan, reasons = evaluate_entry(
+                ticker, stock, idea, fund, fundamentals, state, portfolio, tracked,
+                cash, equity, screen_map, stale_days, today
+            )
+            if plan:
+                candidates.append(plan)
+            elif reasons:
+                print(f"[{ts}] [ВХОД-ОТКАЗ] {ticker}: {'; '.join(reasons)}")
 
-    # ---- 5. АКЦИИ: покупка / докупка ----
-    for s in liquid:
-        t = s["ticker"]
-        if t in GOLD_TICKERS:
-            continue
-        st = tracked.get(t)
-        if not st or t in state["notified_buy"]:
-            continue
-        signal = evaluate_buy_signal(st)
-        if not signal:
-            continue
-
-        current_value = 0.0
-        tradable_existing = 0
-        is_reload = False
-        core_cnt = 0
-        if t in portfolio:
-            pos = portfolio[t]
-            core_cnt = pos.get("core_count", 0)
-            tradable_existing = max(0, pos["count"] - core_cnt)
-            current_value = pos["count"] * st["last"]
-
-            # Если спутник УЖЕ открыт и торгуется, докупаем только в прибыль (пирамидинг)
-            if tradable_existing > 0:
-                if st["last"] <= pos["buy_price"]:
-                    continue
-            else:
-                # Если же спутника нет (осталось только ядро), это перезаход в спутник на откате
-                is_reload = True
-
-        max_allowed = total_equity * MAX_POSITION_PCT
-        additional_allowed = max_allowed - current_value
-        lot_cost = st["last"] * st["lot_size"]
-        if additional_allowed < lot_cost:
-            continue
-
-        msg = format_buy_message(signal, cash, total_equity,
-                                 current_value, additional_allowed,
-                                 is_reload=is_reload, core_count=core_cnt)
-        if is_reload:
-            kind = "RELOAD"
-        elif current_value > 0:
-            kind = "ДОКУПКА"
-        else:
-            kind = "ПОКУПКА"
-
-        if dispatch_notification(f"{t}_BUY", kind, t, msg):
-            print(f"[{ts}] [{kind}] {t}: {st['change_pct']:+.2f}%, "
-                  f"Z={st['z_score']:+.2f}, RSI={st['rsi']:.1f}, "
-                  f"ATR%={st['atr_pct']:.2f}, доп={additional_allowed:.0f}₽")
-            state["notified_buy"].append(t)
+        candidates.sort(
+            key=lambda p: (p["expectancy_r"], p["score"],
+                           int(p["idea"].get("conviction", 0))),
+            reverse=True,
+        )
+        if candidates:
+            plan = candidates[0]
+            plan["today"] = today
+            key = f"{plan['ticker']}_ENTRY"
+            if dispatch_notification(key, "ENTRY", plan["ticker"],
+                                     format_entry_message(plan)):
+                state["pending_entries"][plan["ticker"]] = {
+                    "date": today_str,
+                    "value": float(plan["value"]),
+                    "risk": float(plan["risk_rub"]),
+                    "sector": plan["sector"],
+                }
+                print(f"[{ts}] [ПОКУПКА] {plan['ticker']}: "
+                      f"{plan['shares']} шт., E_R={plan['expectancy_r']:+.2f}, "
+                      f"риск={plan['risk_rub']:.0f} ₽")
 
     save_state(state)
     return True
 
 
 # ==============================================================================
-# 16. MAIN
+# 21. CLI
 # ==============================================================================
 
-def print_header():
-    print("=" * 75)
-    print(" MOEX Stock Tracker v3.6 — ATR + золото + журнал + pre-TP1 + ядро ")
-    print("=" * 75)
-    print(f"Акции: TP " + ", ".join(
-        f"{l['atr_mult']}ATR→{int(l['sell_pct']*100)}%" for l in TAKE_PROFIT_ATR_LEVELS))
-    print(f"  стоп {INITIAL_STOP_ATR} ATR | после TP1 → безубыток +{BREAKEVEN_PLUS_ATR} ATR")
-    print(f"  pre-TP1: при peak ≥ buy + {PRE_TP1_PROTECT_ATR} ATR → стоп buy + {PRE_TP1_PROTECT_PLUS_ATR} ATR")
-    print(f"  Chandelier: пик − {TRAILING_ATR_MULT} ATR")
-    print(f"Золото: SMA{GOLD_MA_PERIOD} + RSI<{GOLD_RSI_ENTRY} | TP " + ", ".join(
-        f"{l['atr_mult']}ATR→{int(l['sell_pct']*100)}%" for l in GOLD_TAKE_PROFIT_LEVELS))
-    print(f"  стоп {GOLD_STOP_ATR} ATR | Chandelier {GOLD_TRAILING_ATR} ATR | "
-          f"лимит {GOLD_MAX_POSITION_PCT*100:.0f}%")
-    print(f"Риск: {RISK_PER_TRADE_PCT*100:.1f}% | Макс. позиция: {MAX_POSITION_PCT*100:.0f}%")
-    print(f"Комиссия: {COMMISSION_PCT}% | НДФЛ: {TAX_PCT}% | TOP_N: {TOP_N_LIQUID}")
-    print(f"Интервал: {CHECK_INTERVAL_SECONDS}с")
-    print(f"Файлы: {PORTFOLIO_FILE}, {STATE_FILE}, {NOTIFICATIONS_FILE}")
+def print_header() -> None:
+    print("=" * 82)
+    print(f" MOEX Stock Tracker v{VERSION} — спекулятивный портфель на идеях ВТБ ")
+    print("=" * 82)
+    print("Стратегия: long-only, cash-only, TQBR, без ядра и без усреднения вниз.")
+    print(f"Вход: идеи ВТБ, зона входа, R:R >= {MIN_RR}, "
+          f"E_R >= {MIN_EXPECTANCY_R} после издержек и НДФЛ.")
+    print(f"Ладдер: TP1 = {TP1_R:.1f}R, TP2 = {TP2_R:.1f}R, "
+          f"финал = цель ВТБ; последняя ступень продаёт всё.")
+    print(f"Стоп: {INITIAL_STOP_ATR:.1f} ATR / структурный, "
+          f"Chandelier {TRAILING_ATR_MULT:.1f} ATR, безубыток с издержками.")
+    print(f"Риск: {RISK_PER_TRADE_PCT*100:.2f}% на сделку | "
+          f"heat {MAX_PORTFOLIO_HEAT_PCT*100:.0f}% | "
+          f"макс. позиция {MAX_POSITION_PCT*100:.0f}% | "
+          f"сектор {MAX_SECTOR_PCT*100:.0f}%")
+    print(f"Горизонт: до {MAX_TRADING_HORIZON_DAYS} дн. | "
+          f"legacy wind-down {MAX_LEGACY_HOLDING_DAYS} дн.")
+    print(f"Издержки: комиссия {COMMISSION_PCT}% | slippage {SLIPPAGE_PCT}% | "
+          f"НДФЛ {TAX_PCT}%")
+    print(f"Файлы: {PORTFOLIO_FILE}, {IDEAS_FILE}, {FUNDAMENTALS_FILE}, "
+          f"{STATE_FILE}, {NOTIFICATIONS_FILE}")
     print(f"Telegram: " + ("ТЕСТ (токен не задан)" if is_test_mode() else "включён"))
-    print("=" * 75)
+    print("=" * 82)
 
 
-def main():
-    if "--send-pending" in sys.argv:
+def _load_runtime(require_state: bool = True) -> Tuple[Optional[dict], Optional[str]]:
+    state, state_err = load_state()
+    if state_err and require_state:
+        return None, state_err
+    if state_err:
+        state = default_state()
+    return state, None
+
+
+def run_screen_cli() -> None:
+    state, err = _load_runtime(require_state=False)
+    if err:
+        print(f"[ОШИБКА] {err}")
+        return
+    portfolio, cash, pf_err = load_portfolio()
+    if pf_err:
+        print(f"[ПРЕДУПРЕЖДЕНИЕ] {pf_err}")
+        portfolio, cash = {}, 0.0
+    ideas, idea_warnings, _ = load_ideas()
+    fundamentals, fund_warnings, fund_available, stale_days = load_fundamentals()
+    for w in idea_warnings + fund_warnings:
+        print(f"[ВНИМАНИЕ] {w}")
+    if not fund_available:
+        print("[ОШИБКА] fundamentals.json недоступен — скринер невозможен.")
+        return
+
+    today = datetime.now(MSK_TZ).date()
+    priority = _candidate_priority(portfolio, ideas, fundamentals, today)
+    try:
+        all_stocks, _ = get_moex_market_data(priority)
+    except Exception as e:
+        print(f"[ОШИБКА] MOEX: {e}")
+        return
+    tracked = {t: all_stocks[t] for t in priority if t in all_stocks}
+    index_closes = [float(c[1]) for c in fetch_index_candles(create_moex_session())
+                    if c and c[1] is not None]
+    enrich_with_indicators(list(tracked.values()), index_closes)
+    screen_map, rows, warnings = build_screen_map(
+        tracked, fundamentals, ideas, portfolio, state, index_closes, today
+    )
+    for w in warnings:
+        print(f"[ВНИМАНИЕ] {w}")
+
+    print("\n" + "=" * 150)
+    print(f"КОЛИЧЕСТВЕННЫЙ СКРИНИНГ — {len(rows)} тикеров, "
+          f"данные fundamentals: {stale_days if stale_days is not None else '?'} дн.")
+    print("=" * 150)
+    print(f"{'#':>2} | {'Тикер':<6} | {'Сектор':<18} | {'Цена':>9} | "
+          f"{'Цель':>9} | {'Up%':>7} | {'R:R':>6} | {'E_R':>7} | "
+          f"{'Score':>6} | {'Val':>5} | {'Qual':>5} | {'Mom':>5} | "
+          f"{'Risk':>5} | Вердикт")
+    print("-" * 150)
+    for i, row in enumerate(rows[:20], 1):
+        target = row.get("idea_target")
+        target_str = f"{target:.2f}" if target else "-"
+        up = ((target / row["price"] - 1.0) * 100.0) if target else None
+        up_str = f"{up:+.1f}" if up is not None else "-"
+        rr = f"{row['target_r']:.2f}" if row["target_r"] is not None else "-"
+        er = f"{row['expectancy_r']:+.2f}" if row["expectancy_r"] is not None else "-"
+        print(f"{i:>2} | {row['ticker']:<6} | {row['sector'][:18]:<18} | "
+              f"{row['price']:>9.2f} | {target_str:>9} | {up_str:>7} | "
+              f"{rr:>6} | {er:>7} | {row['score']:>+6.2f} | "
+              f"{row['value_score']:>+5.2f} | {row['quality_score']:>+5.2f} | "
+              f"{row['momentum_score']:>+5.2f} | {row['risk_score']:>+5.2f} | "
+              f"{row['verdict']}")
+    print("-" * 150)
+    buy_now = [r for r in rows if r["verdict"] == "BUY NOW"]
+    print(f"BUY NOW: {', '.join(r['ticker'] for r in buy_now) if buy_now else 'нет'}")
+    print("Скринер только ранжирует; покупки инициирует основной цикл по идеям ВТБ.")
+    print("=" * 150 + "\n")
+
+
+def run_stats_cli() -> None:
+    state, err = _load_runtime(require_state=False)
+    if err:
+        print(f"[ОШИБКА] {err}")
+        return
+    portfolio, cash, pf_err = load_portfolio()
+    if pf_err:
+        print(f"[ПРЕДУПРЕЖДЕНИЕ] {pf_err}")
+        portfolio = {}
+    tracked: Dict[str, dict] = {}
+    if portfolio:
+        try:
+            all_stocks, _ = get_moex_market_data(set(portfolio))
+            tracked = {t: all_stocks[t] for t in portfolio if t in all_stocks}
+            enrich_with_indicators(list(tracked.values()))
+        except Exception as e:
+            print(f"[ПРЕДУПРЕЖДЕНИЕ] не удалось получить рынок: {e}")
+    print_trade_stats(state, portfolio, tracked)
+
+
+def run_reset_plan_cli(argv: List[str]) -> None:
+    try:
+        idx = argv.index("--reset-plan")
+        ticker = argv[idx + 1].upper()
+    except Exception:
+        print("Использование: python moex_tracker.py --reset-plan TICKER")
+        return
+    state, err = _load_runtime(require_state=True)
+    if err or state is None:
+        print(f"[ОШИБКА] {err}")
+        return
+    portfolio, cash, pf_err = load_portfolio()
+    if pf_err:
+        print(f"[ОШИБКА] {pf_err}")
+        return
+    if ticker not in portfolio:
+        print(f"[ОШИБКА] {ticker} нет в portfolio.json")
+        return
+    ideas, _, ideas_available = load_ideas()
+    fundamentals, _, _, _ = load_fundamentals()
+    try:
+        all_stocks, _ = get_moex_market_data({ticker})
+    except Exception as e:
+        print(f"[ОШИБКА] MOEX: {e}")
+        return
+    stock = all_stocks.get(ticker)
+    if not stock:
+        print(f"[ОШИБКА] {ticker} нет в TQBR")
+        return
+    enrich_with_indicators([stock])
+    today = datetime.now(MSK_TZ).date()
+    idea = active_idea_for(ticker, ideas, today) if ideas_available else None
+    plan = build_position_plan(ticker, portfolio[ticker], stock, idea, today,
+                               anchor=float(stock["last"]))
+    if not plan:
+        print(f"[ОШИБКА] не удалось построить план для {ticker}")
+        return
+    state["positions"][ticker] = plan
+    state.get("pending_entries", {}).pop(ticker, None)
+    save_state(state)
+    kind = "legacy" if plan["legacy"] else "идея ВТБ"
+    print(f"[RESET] {ticker}: план пересчитан ({kind}) от {plan['plan_anchor']:.2f} ₽")
+    print(f"  Стоп: {plan['initial_stop']:.2f} ₽ | "
+          f"Цели: {[round(x, 2) for x in plan['targets']]}")
+    print(f"  R: {plan['risk_per_share']:.2f} ₽ | "
+          f"Риск: {plan['initial_risk_rub']:.2f} ₽")
+
+
+def main() -> None:
+    argv = sys.argv[1:]
+    if "--send-pending" in argv:
         print_header()
         send_pending_notifications()
         return
-    if "--show" in sys.argv:
+    if "--show" in argv:
         print_header()
         show_recent_notifications(30)
         return
-    if "--audit-buffett" in sys.argv:
+    if "--migrate" in argv:
         print_header()
-        all_stocks, liquid = get_moex_market_data()
-        portfolio, cash = load_portfolio(PORTFOLIO_FILE)
-        tracked = {t: all_stocks[t] for t in portfolio if t in all_stocks}
-        for s in liquid:
-            tracked.setdefault(s["ticker"], s)
-        enrich_with_indicators(list(tracked.values()))
-        state = load_state()
-        run_buffett_audit(portfolio, tracked, state, force_notify=True)
-        save_state(state)
+        run_migration()
+        return
+    if "--ideas-check" in argv:
+        print_header()
+        sys.exit(ideas_check())
+    if "--screen" in argv:
+        print_header()
+        run_screen_cli()
+        return
+    if "--stats" in argv:
+        print_header()
+        run_stats_cli()
+        return
+    if "--reset-plan" in argv:
+        print_header()
+        run_reset_plan_cli(argv)
+        return
+    if "--once" in argv:
+        print_header()
+        state, err = load_state()
+        if err:
+            print(f"\n[ОСТАНОВ] {err}")
+            print("Перед первым запуском v4 выполните:")
+            print("  python moex_tracker.py --migrate")
+            return
+        ok = run_iteration(state)
+        print("\n[ONCE] Итерация завершена." if ok else "\n[ONCE] Итерация не выполнена.")
         return
 
     print_header()
+    state, err = load_state()
+    if err:
+        print(f"\n[ОСТАНОВ] {err}")
+        print("Перед первым запуском v4 выполните:")
+        print("  python moex_tracker.py --migrate")
+        return
 
-    state = load_state()
     try_send_pending_silent()
     show_recent_notifications(RECENT_NOTIFICATIONS_SHOWN)
 
