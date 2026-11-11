@@ -165,6 +165,27 @@ assert m.evaluate_stop(
 ) is None
 pstate_stop["exit_alerted"] = False
 
+# Проверка поджима стопа:
+# На стадии 0 стоп НЕ поджимается при peak = anchor + 0.8R (дает свободу колебаниям)
+pstate_stop["stop_current"] = pstate_stop["initial_stop"]
+pstate_stop["peak"] = 108.0
+pstate_stop["stage"] = 0
+m.update_stops(state_stop, {"AAA": _stock(last=105.0, atr=5.0)})
+assert pstate_stop["stop_current"] == pstate_stop["initial_stop"], "На стадии 0 стоп не должен поджиматься до TP1"
+
+# На стадии 1 (после TP1) стоп переносится в безубыток
+pstate_stop["stage"] = 1
+m.update_stops(state_stop, {"AAA": _stock(last=115.0, atr=5.0)})
+assert pstate_stop["stop_current"] >= 100.0, "На стадии 1 стоп должен быть не ниже безубытка"
+
+# На стадии 2 (после TP2) стоп переносится на TP1 и трейлит пик
+pstate_stop["stage"] = 2
+pstate_stop["peak"] = 130.0
+m.update_stops(state_stop, {"AAA": _stock(last=130.0, atr=5.0)})
+assert pstate_stop["stop_current"] >= 110.0, "На стадии 2 стоп должен быть не ниже уровня TP1"
+# Чендлер: 130 - 3*5 = 115.0 >= 110.0
+assert pstate_stop["stop_current"] >= 115.0, "На стадии 2 трейлинг Chandelier защищает остаток"
+
 # ==============================================================================
 # 7. ФИКСАЦИЯ ПРИБЫЛИ
 # ==============================================================================
@@ -180,7 +201,17 @@ tp1 = m.evaluate_profit(
 )
 assert tp1 is not None
 assert tp1["shares"] == 40 and tp1["level_name"] == "TP1"
-assert tp1["stop_after"] >= 102.5
+assert tp1["stop_after"] >= 100.0
+
+pstate_tp["sold"] = 40
+pstate_tp["stage"] = 1
+tp2 = m.evaluate_profit(
+    "AAA", {"count": 60, "buy_price": 95.0},
+    {"last": 121.0, "bid": 121.0, "lot_size": 1}, state_tp
+)
+assert tp2 is not None
+assert tp2["shares"] == 30 and tp2["level_name"] == "TP2"
+assert tp2["stop_after"] >= 110.0
 
 pstate_tp["sold"] = 70
 pstate_tp["stage"] = 2
@@ -213,13 +244,20 @@ assert below is not None and below["is_final"] is True
 # ==============================================================================
 
 pstate_time = m.build_position_plan("AAA", _pos(), _stock(), TODAY)
-pstate_time["opened_at"] = (TODAY - timedelta(days=121)).isoformat()
+pstate_time["opened_at"] = (TODAY - timedelta(days=181)).isoformat()
 state_time = {"positions": {"AAA": pstate_time}}
 time_plan = m.evaluate_time(
     "AAA", {"count": 100, "buy_price": 95.0},
     {"last": 100.0, "bid": 99.0, "lot_size": 1}, state_time, TODAY
 )
 assert time_plan is not None and time_plan["is_final"] is True
+
+# При 121 дне (ранее лимит 120) теперь позиция еще жива:
+pstate_time["opened_at"] = (TODAY - timedelta(days=121)).isoformat()
+assert m.evaluate_time(
+    "AAA", {"count": 100, "buy_price": 95.0},
+    {"last": 100.0, "bid": 99.0, "lot_size": 1}, state_time, TODAY
+) is None
 
 pstate_time["opened_at"] = TODAY.isoformat()
 assert m.evaluate_time(

@@ -23,10 +23,6 @@
     "count": 9,
     "buy_price": 1106.3
   },
-  "SNGSP": {
-    "count": 160,
-    "buy_price": 40.75
-  },
   "ROSN": {
     "count": 25,
     "buy_price": 386.7
@@ -51,9 +47,13 @@
     "count": 11,
     "buy_price": 707.8
   },
+  "PRMD": {
+    "count": 17,
+    "buy_price": 421.45
+  },
   "GOLD": {
     "count": 9652,
     "buy_price": 2.7855
   },
-  "CASH": 10448.0
+  "CASH": 150
 }

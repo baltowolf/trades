@@ -22,11 +22,12 @@ MOEX Stock Tracker v5.0 — sell-only трекер.
     R = plan_anchor - initial_stop
     Стоп: plan_anchor - min(3 ATR, 18% цены)
     Без target: TP на 2 / 4 / 6 ATR, доли 40% / 30% / остаток.
-    С target: TP1 на 1R (50% или 40%), TP2 на 2R (30%),
+    С target: TP1 на 2 ATR (40%), TP2 на 4 ATR (30%),
               финал — target; последняя ступень продаёт всё.
     После TP1 стоп в безубыток с учётом комиссии и НДФЛ.
-    Chandelier: peak - 3 ATR.
-    Горизонт: 120 дней от старта плана.
+    После TP2 стоп на уровень TP1.
+    Chandelier: peak - 3 ATR (для остатка).
+    Горизонт: 180 дней от старта плана.
 
 Команды:
     python moex_tracker.py                 — основной цикл
@@ -70,7 +71,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 # КОНФИГУРАЦИЯ
 # ==============================================================================
 
-VERSION = "5.0.0"
+VERSION = "5.1.0"
 STATE_SCHEMA_VERSION = 4
 
 if os.path.exists(".env"):
@@ -109,7 +110,7 @@ TP1_SELL_PCT_2 = 0.50
 ATR_TP_MULTS = (2.0, 4.0, 6.0)
 ATR_TP_PCTS = (0.40, 0.70, 1.00)
 
-MAX_HOLDING_DAYS = 120
+MAX_HOLDING_DAYS = 180
 
 # --- Издержки ---
 COMMISSION_PCT = 0.1
@@ -750,41 +751,48 @@ def _build_atr_levels(anchor: float, atr: float,
 
 
 def _build_target_levels(anchor: float, stop: float, target: float,
-                         original_count: int, lot: int) -> Optional[List[dict]]:
+                         original_count: int, lot: int,
+                         atr: float = 0.0) -> Optional[List[dict]]:
     if target <= 0:
         return None
     if target <= anchor:
         return _make_levels(
             [("ЦЕЛЬ", target, 1.0, True)], original_count, lot
         )
-    r = anchor - stop
-    if r <= 0:
-        return None
-    target_r = (target - anchor) / r
     if original_count <= lot:
         return _make_levels(
             [("ЦЕЛЬ", target, 1.0, True)], original_count, lot
         )
-    if original_count < 3 * lot:
-        return _make_levels(
-            [("TP1", anchor + TP1_R * r, lot / original_count, False),
-             ("ЦЕЛЬ", target, 1.0, True)],
-            original_count, lot,
-        )
-    if target_r >= 3.0:
+
+    if atr > 0:
+        tp1_price = anchor + 2.0 * atr
+        tp2_price = anchor + 4.0 * atr
+    else:
+        r = anchor - stop
+        if r <= 0:
+            return None
+        tp1_price = anchor + TP1_R * r
+        tp2_price = anchor + TP2_R * r
+
+    if target <= tp1_price:
+        specs = [("ЦЕЛЬ", target, 1.0, True)]
+    elif original_count < 3 * lot:
         specs = [
-            ("TP1", anchor + TP1_R * r, TP1_SELL_PCT_3, False),
-            ("TP2", anchor + TP2_R * r,
-             TP1_SELL_PCT_3 + TP2_SELL_PCT_3, False),
+            ("TP1", tp1_price, lot / original_count, False),
             ("ЦЕЛЬ", target, 1.0, True),
         ]
-    elif target_r >= 1.0:
+    elif target <= tp2_price:
         specs = [
-            ("TP1", anchor + TP1_R * r, TP1_SELL_PCT_2, False),
+            ("TP1", tp1_price, TP1_SELL_PCT_2, False),
             ("ЦЕЛЬ", target, 1.0, True),
         ]
     else:
-        specs = [("ЦЕЛЬ", target, 1.0, True)]
+        specs = [
+            ("TP1", tp1_price, TP1_SELL_PCT_3, False),
+            ("TP2", tp2_price,
+             TP1_SELL_PCT_3 + TP2_SELL_PCT_3, False),
+            ("ЦЕЛЬ", target, 1.0, True),
+        ]
     return _make_levels(specs, original_count, lot)
 
 
@@ -820,7 +828,9 @@ def build_position_plan(ticker: str, pos: dict, stock: dict,
 
     target = pos.get("target")
     if target is not None:
-        levels = _build_target_levels(anchor, stop, float(target), count, lot)
+        levels = _build_target_levels(
+            anchor, stop, float(target), count, lot, atr=atr
+        )
     else:
         levels = _build_atr_levels(anchor, atr, count, lot)
     if not levels:
@@ -861,7 +871,9 @@ def rebuild_levels(pstate: dict, pos: dict, stock: dict,
     target = pos.get("target")
     atr = float(stock.get("atr", 0.0) or 0.0)
     if target is not None:
-        levels = _build_target_levels(anchor, stop, float(target), count, lot)
+        levels = _build_target_levels(
+            anchor, stop, float(target), count, lot, atr=atr
+        )
     else:
         levels = _build_atr_levels(anchor, atr, count, lot)
     if not levels:
@@ -1005,16 +1017,19 @@ def _executable_tp_price(stock: dict) -> float:
 def _stop_reason(pstate: dict, stop: float, chandelier: float) -> str:
     r = float(pstate.get("risk_per_share", 0.0) or 0.0)
     anchor = float(pstate.get("plan_anchor", 0.0) or 0.0)
+    avg_cost = float(pstate.get("avg_cost", anchor))
     stage = int(pstate.get("stage", 0) or 0)
-    plan_be = breakeven_price(anchor)
+    levels = pstate.get("levels", [])
+    tp1_price = float(levels[0]["price"]) if levels else (anchor + 1.0 * r)
+    plan_be = max(breakeven_price(avg_cost), breakeven_price(anchor))
     if abs(stop - float(pstate.get("initial_stop", 0.0))) < 1e-6:
         return "начальный стоп"
-    if stage >= 2 and r > 0 and stop >= anchor + 1.0 * r - 1e-6:
-        return "защита прибыли 1R"
+    if stage >= 2 and abs(stop - chandelier) < 1e-6 and chandelier > tp1_price:
+        return "Chandelier Exit (трейлинг)"
+    if stage >= 2 and stop >= tp1_price - 1e-6:
+        return "защита прибыли (уровень TP1)"
     if stop >= plan_be - 1e-6:
         return "безубыток с учётом издержек"
-    if abs(stop - chandelier) < 1e-6:
-        return "Chandelier Exit"
     return "трейлинг-стоп"
 
 
@@ -1036,23 +1051,25 @@ def update_stops(state: dict, tracked: Dict[str, dict]) -> None:
             continue
         entry_atr = float(pstate.get("entry_atr", 0.0) or 0.0)
         curr_atr = float(pstate.get("current_atr", entry_atr) or entry_atr)
-        trail_atr = (min(entry_atr, curr_atr)
-                     if entry_atr > 0 and curr_atr > 0 else entry_atr)
+        trail_atr = (max(entry_atr, curr_atr)
+                     if entry_atr > 0 and curr_atr > 0 else (entry_atr or curr_atr))
         peak = float(pstate.get("peak", stock["last"]))
         chandelier = peak - TRAILING_ATR_MULT * trail_atr
         stage = int(pstate.get("stage", 0) or 0)
+        levels = pstate.get("levels", [])
+        avg_cost = float(pstate.get("avg_cost", anchor))
+
         components = [
             float(pstate.get("initial_stop", 0.0)),
             float(pstate.get("stop_current", 0.0)),
-            chandelier,
         ]
         if stage >= 1:
+            components.append(breakeven_price(avg_cost))
             components.append(breakeven_price(anchor))
-            components.append(anchor + PRE_TP1_LOCK_R * r)
         if stage >= 2:
-            components.append(anchor + 1.0 * r)
-        if stage == 0 and peak >= anchor + PRE_TP1_TRIGGER_R * r:
-            components.append(anchor + PRE_TP1_LOCK_R * r)
+            tp1_price = float(levels[0]["price"]) if levels else (anchor + 1.0 * r)
+            components.append(tp1_price)
+            components.append(chandelier)
         pstate["stop_current"] = max(
             float(pstate.get("stop_current", 0.0)), max(components)
         )
@@ -1082,7 +1099,7 @@ def evaluate_stop(ticker: str, pos: dict, stock: dict,
     atr = float(pstate.get("current_atr",
                            pstate.get("entry_atr", 0.0)) or 0.0)
     entry_atr = float(pstate.get("entry_atr", atr) or atr)
-    trail_atr = min(entry_atr, atr) if atr > 0 else entry_atr
+    trail_atr = max(entry_atr, atr) if (entry_atr > 0 and atr > 0) else (entry_atr or atr)
     chandelier = float(pstate.get("peak", price)) - TRAILING_ATR_MULT * trail_atr
     money = net_proceeds(shares, price,
                          float(pstate.get("avg_cost", pos["buy_price"])))
@@ -1151,12 +1168,12 @@ def evaluate_profit(ticker: str, pos: dict, stock: dict,
 
     new_stage = _stage_from_sold(levels, sold + shares)
     anchor = float(pstate.get("plan_anchor", 0.0) or 0.0)
+    avg_cost = float(pstate.get("avg_cost", pos["buy_price"]))
     r = float(pstate.get("risk_per_share", 0.0) or 0.0)
-    stop_after = breakeven_price(anchor) if anchor > 0 else None
-    if stop_after is not None and new_stage >= 1:
-        stop_after = max(stop_after, anchor + PRE_TP1_LOCK_R * r)
+    stop_after = max(breakeven_price(avg_cost), breakeven_price(anchor)) if anchor > 0 else None
     if stop_after is not None and new_stage >= 2:
-        stop_after = max(stop_after, anchor + 1.0 * r)
+        tp1_price = float(levels[0]["price"]) if levels else (anchor + 1.0 * r)
+        stop_after = max(stop_after, tp1_price)
 
     avg_cost = float(pstate.get("avg_cost", pos["buy_price"]))
     money = net_proceeds(shares, price, avg_cost)
@@ -1709,7 +1726,7 @@ def print_header() -> None:
           f"безубыток с издержками.")
     print(f"Без target: TP {ATR_TP_MULTS[0]:.0f}/{ATR_TP_MULTS[1]:.0f}/"
           f"{ATR_TP_MULTS[2]:.0f} ATR, доли 40/30/остаток.")
-    print(f"С target: TP1 = {TP1_R:.1f}R, TP2 = {TP2_R:.1f}R, "
+    print(f"С target: TP1 = 2 ATR (40%), TP2 = 4 ATR (30%), "
           f"финал = target; последняя ступень продаёт всё.")
     print(f"Горизонт: {MAX_HOLDING_DAYS} дн. | "
           f"Издержки: комиссия {COMMISSION_PCT}% | НДФЛ {TAX_PCT}%")

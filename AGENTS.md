@@ -50,12 +50,12 @@ Input `portfolio.json`:
 - **Peak starts at plan inception.** `peak = max(plan_anchor, last)`. Do not seed it from a pre-plan historical high; that can push the stop above the current price and trigger a false liquidation.
 - **Initial stop.** `plan_anchor - min(3 ATR, 18% * plan_anchor)`, or the user-provided `stop`.
 - **ATR ladder without target.** TP1 = +2 ATR (40%), TP2 = +4 ATR (30%), TP3 = +6 ATR (all remainder).
-- **Target ladder.** TP1 = 1R (50% or 40%), TP2 = 2R (30% when target_r >= 3), final = target. The final stage always sells the whole remainder.
+- **Target ladder.** TP1 = +2 ATR (40%), TP2 = +4 ATR (30%), final = target (remainder 30%). If target between TP1 and TP2: TP1 (50%), final = target (50%). The final stage always sells the whole remainder.
 - **Target at or below current price.** Sell the whole position immediately.
-- **Stop ratchet.** After TP1: break-even including commission and NDFL, plus `plan_anchor + 0.25R`. After TP2: `plan_anchor + 1R`. Before TP1: if peak >= `plan_anchor + 0.75R`, stop moves to `plan_anchor + 0.25R`.
+- **Stop ratchet.** At Stage 0: initial stop holds without pre-TP1 tightening (no premature shakeouts). After TP1: break-even including commission and NDFL. After TP2: stop moves to TP1 level (`plan_anchor + 2 ATR`), and trailing chandelier (`peak - 3 ATR`) protects the free runner without dipping below TP1.
 - **Stop trigger price.** `min(last, bid)`; TP trigger price uses `bid` with `last` fallback.
 - **Pending partial sale.** After a partial TP recommendation, `pending_sell_shares` prevents an unchanged `portfolio.json` from being mistaken for a manual buy. Do not reinitialize the plan while the sale is pending.
-- **Time exit.** After 120 days from plan inception, recommend selling the whole position.
+- **Time exit.** After 180 days from plan inception (medium term 3-6 months), recommend selling the whole position.
 - **Closed positions.** After a full exit signal, `exit_alerted=True` suppresses repeated alerts until `portfolio.json` is updated or `--reset-plan` is run.
 - **Telegram.** Dedup by `(key, date)`; key format `TICKER_TRIGGER`. If the token is empty or `ВАШ_ТОКЕН_БОТА`, run in test mode.
 - **Russian comments and log messages.** Keep them Russian.
