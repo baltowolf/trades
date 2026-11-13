@@ -374,7 +374,88 @@ with tempfile.TemporaryDirectory() as tmp:
         os.chdir(old_cwd)
 
 # ==============================================================================
-# 12. ГИГИЕНА
+# 12. НАЗВАНИЯ КОМПАНИЙ И ФОРМАТИРОВАНИЕ
+# ==============================================================================
+
+assert m._display_ticker("SBER", "Сбербанк") == "SBER (Сбербанк)"
+assert m._display_ticker("SBER", "SBER") == "SBER"
+assert m._display_ticker("SBER", None) == "SBER"
+assert m._display_ticker("SBER", "") == "SBER"
+
+stop_msg = m.format_stop_message({
+    "ticker": "PRMD", "name": "Промомед", "price": 400.0, "stop": 400.0,
+    "reason": "Chandelier Exit", "avg_cost": 420.0, "gain_pct": -4.76,
+    "shares": 6, "lots": 6, "net_profit": -120.0, "lot_warning": False,
+})
+assert "PRMD (Промомед)" in stop_msg
+
+profit_msg = m.format_profit_message({
+    "ticker": "PRMD", "name": "Промомед", "level_name": "TP1",
+    "price": 434.0, "target_price": 434.0, "avg_cost": 421.0,
+    "gain_pct": 3.09, "shares": 6, "lots": 6, "sell_ratio": 35.3,
+    "gross": 2604.0, "commission": 5.0, "tax": 10.0,
+    "net_profit": 63.0, "is_final": False, "remaining_after": 11,
+    "stop_after": 422.0, "lot_warning": False,
+})
+assert "PRMD (Промомед)" in profit_msg
+
+time_msg = m.format_time_message({
+    "ticker": "PRMD", "name": "Промомед", "reason": "истёк горизонт",
+    "price": 430.0, "avg_cost": 421.0, "gain_pct": 2.14,
+    "shares": 6, "lots": 6, "net_profit": 50.0, "lot_warning": False,
+})
+assert "PRMD (Промомед)" in time_msg
+
+# ==============================================================================
+# 13. ПОВТОРНАЯ ОТПРАВКА PENDING УВЕДОМЛЕНИЙ
+# ==============================================================================
+
+with tempfile.TemporaryDirectory() as tmp:
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(tmp)
+        yesterday = (datetime.now(m.MSK_TZ).date() - timedelta(days=2)).strftime("%Y-%m-%d")
+        initial_notifs = [
+            {
+                "key": "OLD_TP1",
+                "date": yesterday,
+                "time": "12:00:00",
+                "timestamp": f"{yesterday}T12:00:00+03:00",
+                "kind": "PROFIT",
+                "ticker": "AAA",
+                "name": "ААА Компани",
+                "message": "тестовое сообщение",
+                "telegram_sent": False,
+            }
+        ]
+        with open("notifications.json", "w", encoding="utf-8") as f:
+            json.dump(initial_notifs, f)
+
+        orig_send = m.send_telegram_message
+        orig_is_test = m.is_test_mode
+        sent_messages = []
+        try:
+            m.is_test_mode = lambda: False
+            m.send_telegram_message = lambda msg: (sent_messages.append(msg) or True)
+
+            m.try_send_pending_silent()
+
+            assert len(sent_messages) == 1
+            with open("notifications.json", "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            assert saved[0]["telegram_sent"] is True
+
+            sent_messages.clear()
+            m.try_send_pending_silent()
+            assert len(sent_messages) == 0
+        finally:
+            m.send_telegram_message = orig_send
+            m.is_test_mode = orig_is_test
+    finally:
+        os.chdir(old_cwd)
+
+# ==============================================================================
+# 14. ГИГИЕНА
 # ==============================================================================
 
 with open("moex_tracker.py", "r", encoding="utf-8") as f:

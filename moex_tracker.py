@@ -248,6 +248,12 @@ def _strip_html(text: str) -> str:
             .replace("<i>", "").replace("</i>", ""))
 
 
+def _display_ticker(ticker: str, name: Optional[str] = None) -> str:
+    if name and name != ticker:
+        return f"{ticker} ({name})"
+    return ticker
+
+
 def is_test_mode() -> bool:
     return (not TELEGRAM_BOT_TOKEN
             or TELEGRAM_BOT_TOKEN == "ВАШ_ТОКЕН_БОТА")
@@ -260,28 +266,46 @@ def notification_exists(key: str, date_str: str,
     return any(n.get("key") == key and n.get("date") == date_str for n in notifs)
 
 
+_telegram_network_down: bool = False
+
+
 def send_telegram_message(html_text: str) -> bool:
+    global _telegram_network_down
     if is_test_mode():
         print(f"\n[TELEGRAM ТЕСТ — токен не задан]\n{_strip_html(html_text)}\n"
               + "-" * 60)
+        _telegram_network_down = False
         return True
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": html_text,
                "parse_mode": "HTML"}
     try:
-        r = requests.post(url, json=payload, timeout=10)
+        r = requests.post(url, json=payload, timeout=5)
         r.raise_for_status()
+        _telegram_network_down = False
         return True
     except requests.RequestException as e:
+        if hasattr(e, "response") and e.response is not None and e.response.status_code == 400:
+            try:
+                p2 = {"chat_id": TELEGRAM_CHAT_ID, "text": _strip_html(html_text)}
+                r2 = requests.post(url, json=p2, timeout=5)
+                r2.raise_for_status()
+                _telegram_network_down = False
+                return True
+            except requests.RequestException:
+                pass
         err_msg = str(e)
         if hasattr(e, "response") and e.response is not None:
             err_msg += f" | {e.response.text}"
         print(f"[ОШИБКА TELEGRAM] {err_msg}")
+        _telegram_network_down = (isinstance(e, (requests.ConnectionError, requests.Timeout))
+                                  or (hasattr(e, "response") and e.response is not None
+                                      and e.response.status_code in (429, 500, 502, 503, 504)))
         return False
 
 
 def dispatch_notification(key: str, kind: str, ticker: str,
-                          message: str) -> bool:
+                          message: str, name: Optional[str] = None) -> bool:
     ts = datetime.now(MSK_TZ)
     date_str = ts.strftime("%Y-%m-%d")
     notifs = load_notifications()
@@ -297,6 +321,7 @@ def dispatch_notification(key: str, kind: str, ticker: str,
         "timestamp": ts.isoformat(),
         "kind": kind,
         "ticker": ticker,
+        "name": name or "",
         "message": message,
         "telegram_sent": really_sent,
     })
@@ -304,9 +329,10 @@ def dispatch_notification(key: str, kind: str, ticker: str,
     save_notifications(notifs[:MAX_NOTIFICATIONS_KEPT])
 
     if not really_sent and not is_test_mode():
+        disp = _display_ticker(ticker, name)
         print("\n" + "=" * 70)
         print(f"[УВЕДОМЛЕНИЕ — Telegram недоступен] "
-              f"{kind} {ticker} {ts.strftime('%H:%M:%S')}")
+              f"{kind} {disp} {ts.strftime('%H:%M:%S')}")
         print("-" * 70)
         print(_strip_html(message))
         print("=" * 70)
@@ -323,33 +349,36 @@ def show_recent_notifications(n: int = RECENT_NOTIFICATIONS_SHOWN) -> None:
     print("=" * 70)
     for notif in notifs[:n]:
         sent_mark = "✓ TG" if notif.get("telegram_sent") else "✗ TG"
+        disp = _display_ticker(notif.get("ticker", ""), notif.get("name"))
         print(f"[{notif.get('date')} {notif.get('time')}] "
-              f"{notif.get('kind')} {notif.get('ticker')}  [{sent_mark}]")
+              f"{notif.get('kind')} {disp}  [{sent_mark}]")
         print("-" * 70)
         print(_strip_html(notif.get("message", "")))
         print("=" * 70)
 
 
 def send_pending_notifications() -> None:
-    today = datetime.now(MSK_TZ).strftime("%Y-%m-%d")
     notifs = load_notifications()
-    pending = [n for n in notifs
-               if n.get("date") == today and not n.get("telegram_sent")]
+    pending = [n for n in notifs if not n.get("telegram_sent")]
     if not pending:
-        print(f"[PENDING] Нет неотправленных за {today}.")
+        print("[PENDING] Нет неотправленных уведомлений.")
         return
     if is_test_mode():
         print("[PENDING] Telegram не настроен. Уведомления только в файле.")
         return
-    print(f"[PENDING] Найдено {len(pending)} неотправленных за {today}.")
+    pending.sort(key=lambda x: x.get("timestamp", ""))
+    print(f"[PENDING] Найдено {len(pending)} неотправленных.")
     sent = 0
     for n in pending:
+        disp = _display_ticker(n.get("ticker", ""), n.get("name"))
         if send_telegram_message(n["message"]):
             n["telegram_sent"] = True
             sent += 1
-            print(f"[PENDING] OK: {n['kind']} {n['ticker']} {n['time']}")
+            print(f"[PENDING] OK: {n['kind']} {disp} {n.get('date')} {n.get('time')}")
         else:
-            print(f"[PENDING] FAIL: {n['kind']} {n['ticker']} {n['time']}")
+            print(f"[PENDING] FAIL: {n['kind']} {disp} {n.get('date')} {n['time']}")
+            if _telegram_network_down:
+                break
     if sent > 0:
         save_notifications(notifs)
     print(f"[PENDING] Отправлено {sent} из {len(pending)}.")
@@ -358,23 +387,21 @@ def send_pending_notifications() -> None:
 def try_send_pending_silent() -> None:
     if is_test_mode():
         return
-    today = datetime.now(MSK_TZ).strftime("%Y-%m-%d")
     notifs = load_notifications()
-    pending = [n for n in notifs
-               if n.get("date") == today and not n.get("telegram_sent")]
+    pending = [n for n in notifs if not n.get("telegram_sent")]
     if not pending:
         return
-    print(f"[STARTUP] Найдено {len(pending)} неотправленных за сегодня. Пробую...")
+    pending.sort(key=lambda x: x.get("timestamp", ""))
     sent = 0
     for n in pending:
         if send_telegram_message(n["message"]):
             n["telegram_sent"] = True
             sent += 1
+        elif _telegram_network_down:
+            break
     if sent > 0:
         save_notifications(notifs)
-        print(f"[STARTUP] Дослано {sent} из {len(pending)}.")
-    else:
-        print(f"[STARTUP] Telegram недоступен. Смотри {NOTIFICATIONS_FILE}.")
+        print(f"[RETRY] Дослано в Telegram: {sent} из {len(pending)} неотправленных.")
 
 
 # ==============================================================================
@@ -897,21 +924,23 @@ def sync_state_with_portfolio(state: dict, portfolio: Dict[str, dict],
     for ticker in list(pos_state.keys()):
         if ticker not in portfolio:
             p = pos_state[ticker]
+            disp = _display_ticker(ticker, p.get("name") or (tracked.get(ticker, {}).get("name") if tracked else None))
             if p.get("exit_alerted") or int(p.get("sold", 0)) >= int(
                     p.get("original_count", 0)):
-                changes.append(f"{ticker}: закрыта, удалена из state")
+                changes.append(f"{disp}: закрыта, удалена из state")
             else:
-                changes.append(f"{ticker}: удалена из portfolio вручную")
+                changes.append(f"{disp}: удалена из portfolio вручную")
             pos_state.pop(ticker, None)
 
     for ticker, pos in portfolio.items():
         stock = tracked.get(ticker)
+        disp = _display_ticker(ticker, stock.get("name") if stock else None)
         if not stock:
-            changes.append(f"{ticker}: нет рыночных данных, пропуск")
+            changes.append(f"{disp}: нет рыночных данных, пропуск")
             continue
         atr = float(stock.get("atr", 0.0) or 0.0)
         if atr <= 0:
-            changes.append(f"{ticker}: ATR=0, пропуск")
+            changes.append(f"{disp}: ATR=0, пропуск")
             continue
         pstate = pos_state.get(ticker)
 
@@ -920,12 +949,12 @@ def sync_state_with_portfolio(state: dict, portfolio: Dict[str, dict],
             if plan:
                 pos_state[ticker] = plan
                 changes.append(
-                    f"{ticker}: новый план, anchor={plan['plan_anchor']:.3f}, "
+                    f"{disp}: новый план, anchor={plan['plan_anchor']:.3f}, "
                     f"стоп={plan['initial_stop']:.3f}, "
                     f"цели={[round(x, 2) for x in plan['targets']]}"
                 )
             else:
-                changes.append(f"{ticker}: не удалось построить план")
+                changes.append(f"{disp}: не удалось построить план")
             continue
 
         pstate["current_atr"] = atr
@@ -959,7 +988,7 @@ def sync_state_with_portfolio(state: dict, portfolio: Dict[str, dict],
                 pstate["stage"] = _stage_from_sold(
                     pstate.get("levels", []), int(pstate["sold"])
                 )
-                changes.append(f"{ticker}: ручная продажа после exit, "
+                changes.append(f"{disp}: ручная продажа после exit, "
                                f"sold={pstate['sold']}")
             continue
 
@@ -971,7 +1000,7 @@ def sync_state_with_portfolio(state: dict, portfolio: Dict[str, dict],
                 pos_state[ticker] = plan
                 reason = "докупка" if count > expected else "смена buy_price"
                 changes.append(
-                    f"{ticker}: переинициализация ({reason}) [{old}] → "
+                    f"{disp}: переинициализация ({reason}) [{old}] → "
                     f"count={count}, buy={pos['buy_price']:.3f}, "
                     f"anchor={plan['plan_anchor']:.3f}"
                 )
@@ -983,7 +1012,7 @@ def sync_state_with_portfolio(state: dict, portfolio: Dict[str, dict],
                 pstate.get("levels", []), int(pstate["sold"])
             )
             changes.append(
-                f"{ticker}: ручная продажа {expected - count} шт., "
+                f"{disp}: ручная продажа {expected - count} шт., "
                 f"sold={pstate['sold']}, остаток={count}"
             )
 
@@ -991,11 +1020,11 @@ def sync_state_with_portfolio(state: dict, portfolio: Dict[str, dict],
             lot = int(stock.get("lot_size", 1) or 1)
             if rebuild_levels(pstate, pos, stock, lot):
                 changes.append(
-                    f"{ticker}: target обновлён, "
+                    f"{disp}: target обновлён, "
                     f"цели={[round(x, 2) for x in pstate['targets']]}"
                 )
             else:
-                changes.append(f"{ticker}: не удалось пересчитать уровни")
+                changes.append(f"{disp}: не удалось пересчитать уровни")
 
     return changes
 
@@ -1105,6 +1134,7 @@ def evaluate_stop(ticker: str, pos: dict, stock: dict,
                          float(pstate.get("avg_cost", pos["buy_price"])))
     return {
         "ticker": ticker,
+        "name": stock.get("name", ticker),
         "trigger": "STOP",
         "is_final": True,
         "price": price,
@@ -1179,6 +1209,7 @@ def evaluate_profit(ticker: str, pos: dict, stock: dict,
     money = net_proceeds(shares, price, avg_cost)
     return {
         "ticker": ticker,
+        "name": stock.get("name", ticker),
         "trigger": str(level["name"]),
         "level_idx": selected_idx,
         "level_name": str(level["name"]),
@@ -1224,6 +1255,7 @@ def evaluate_time(ticker: str, pos: dict, stock: dict, state: dict,
     money = net_proceeds(shares, price, avg_cost)
     return {
         "ticker": ticker,
+        "name": stock.get("name", ticker),
         "trigger": "TIME",
         "is_final": True,
         "price": price,
@@ -1371,8 +1403,9 @@ def _fmt_money(value: float) -> str:
 def format_stop_message(p: dict) -> str:
     lot_line = ("⚠️ Остаток меньше лота — продайте вручную.\n"
                 if p.get("lot_warning") else "")
+    disp = _display_ticker(p["ticker"], p.get("name"))
     return (
-        f"🛑 <b>СТОП — {p['ticker']}</b>\n"
+        f"🛑 <b>СТОП — {disp}</b>\n"
         f"Цена: {p['price']:.2f} ₽ | Стоп: {p['stop']:.2f} ₽\n"
         f"Причина: {p['reason']}\n"
         f"Покупка: {p['avg_cost']:.2f} ₽ | P&L: {p['gain_pct']:+.2f}%\n"
@@ -1391,8 +1424,9 @@ def format_profit_message(p: dict) -> str:
                  if p.get("stop_after") is not None else "")
     lot_line = ("⚠️ Остаток меньше лота — продайте вручную.\n"
                 if p.get("lot_warning") else "")
+    disp = _display_ticker(p["ticker"], p.get("name"))
     return (
-        f"🎯 <b>{p['level_name']} — {p['ticker']}</b>\n"
+        f"🎯 <b>{p['level_name']} — {disp}</b>\n"
         f"Цена: {p['price']:.2f} ₽ | Покупка: {p['avg_cost']:.2f} ₽ | "
         f"P&L: {p['gain_pct']:+.2f}%\n"
         f"Уровень: {p['target_price']:.2f} ₽\n"
@@ -1410,8 +1444,9 @@ def format_profit_message(p: dict) -> str:
 def format_time_message(p: dict) -> str:
     lot_line = ("⚠️ Остаток меньше лота — продайте вручную.\n"
                 if p.get("lot_warning") else "")
+    disp = _display_ticker(p["ticker"], p.get("name"))
     return (
-        f"🚪 <b>ГОРИЗОНТ — {p['ticker']}</b>\n"
+        f"🚪 <b>ГОРИЗОНТ — {disp}</b>\n"
         f"Причина: {p['reason']}\n"
         f"Цена: {p['price']:.2f} ₽ | Покупка: {p['avg_cost']:.2f} ₽ | "
         f"P&L: {p['gain_pct']:+.2f}%\n"
@@ -1429,20 +1464,21 @@ def format_time_message(p: dict) -> str:
 
 def print_dashboard(portfolio: Dict[str, dict], tracked: Dict[str, dict],
                     cash: float, state: dict) -> None:
-    print("\n" + "=" * 158)
-    print(f"{'Тикер':<6} | {'Всего':>7} | {'Покупка':>9} | {'Рынок':>9} | "
+    print("\n" + "=" * 172)
+    print(f"{'Тикер (Компания)':<20} | {'Всего':>7} | {'Покупка':>9} | {'Рынок':>9} | "
           f"{'День%':>7} | {'Доход%':>7} | {'P&L,₽':>10} | {'ATR%':>6} | "
           f"{'RSI':>5} | {'Стоп':>9} | {'TP1':>9} | {'TP2':>9} | "
           f"{'TP3':>9} | {'Стадия':>6} | {'Дней':>5} | {'Статус'}")
-    print("-" * 158)
+    print("-" * 172)
 
     total_val = 0.0
     total_cost = 0.0
     today = datetime.now(MSK_TZ).date()
     for ticker, pos in portfolio.items():
         stock = tracked.get(ticker)
+        disp = _display_ticker(ticker, stock.get("name") if stock else None)
         if not stock:
-            print(f"{ticker:<6} | {pos['count']:>7} | НЕТ ДАННЫХ")
+            print(f"{disp:<20} | {pos['count']:>7} | НЕТ ДАННЫХ")
             continue
         cur = float(stock["last"])
         buy = float(pos["buy_price"])
@@ -1469,20 +1505,20 @@ def print_dashboard(portfolio: Dict[str, dict], tracked: Dict[str, dict],
         else:
             status = "OK"
 
-        print(f"{ticker:<6} | {cnt:>7} | {buy:>9.2f} | {cur:>9.2f} | "
+        print(f"{disp:<20} | {cnt:>7} | {buy:>9.2f} | {cur:>9.2f} | "
               f"{stock.get('change_pct', 0.0):>+6.2f}% | {gain:>+6.2f}% | "
               f"{pnl:>+9.2f} | {stock.get('atr_pct', 0.0):>6.2f} | "
               f"{stock.get('rsi', 50.0):>5.1f} | {stop:>9.2f} | "
               f"{tp1:>9.2f} | {tp2:>9.2f} | {tp3:>9.2f} | "
               f"{stage:>3}/{len(levels):<2} | {hold_days:>5} | {status}")
 
-    print("-" * 158)
+    print("-" * 172)
     total_pnl = total_val - total_cost
     total_pnl_pct = (total_pnl / total_cost * 100.0) if total_cost > 0 else 0.0
     print(f"Активы: {_fmt_money(total_val)} ₽ | Кэш: {_fmt_money(cash)} ₽ | "
           f"Капитал: {_fmt_money(total_val + cash)} ₽")
     print(f"P&L: {total_pnl:+,.2f} ₽ ({total_pnl_pct:+.2f}%)")
-    print("=" * 158 + "\n")
+    print("=" * 172 + "\n")
 
 
 def print_trade_stats(state: dict, portfolio: Optional[Dict[str, dict]] = None,
@@ -1523,7 +1559,9 @@ def print_trade_stats(state: dict, portfolio: Optional[Dict[str, dict]] = None,
             print("-" * 78)
             print("ОТКРЫТЫЕ ПОЗИЦИИ (unrealized):")
             for ticker, pnl, r_mult in open_rows:
-                print(f"{ticker:<7} P&L={_fmt_money(pnl):>12} ₽  R={r_mult:+.2f}")
+                stk = tracked.get(ticker)
+                disp = _display_ticker(ticker, stk.get("name") if stk else None)
+                print(f"{disp:<20} P&L={_fmt_money(pnl):>12} ₽  R={r_mult:+.2f}")
     print("=" * 78 + "\n")
 
 
@@ -1605,7 +1643,8 @@ def _dispatch_full_exit(state: dict, ticker: str, plan: dict,
     if not pstate:
         return False
     key = f"{ticker}_{plan['trigger']}"
-    if not dispatch_notification(key, kind, ticker, message):
+    if not dispatch_notification(key, kind, ticker, message,
+                                 name=plan.get("name")):
         return False
     apply_exit(state, ticker, pstate, plan, plan["today"])
     return True
@@ -1617,7 +1656,8 @@ def _dispatch_partial_exit(state: dict, ticker: str, plan: dict) -> bool:
         return False
     key = f"{ticker}_{plan['trigger']}"
     if not dispatch_notification(key, "PROFIT", ticker,
-                                 format_profit_message(plan)):
+                                 format_profit_message(plan),
+                                 name=plan.get("name")):
         return False
     apply_exit(state, ticker, pstate, plan, plan["today"])
     return True
@@ -1628,6 +1668,8 @@ def run_iteration(state: dict) -> bool:
     ts = now.strftime("%H:%M:%S")
     today = now.date()
     today_str = today.isoformat()
+
+    try_send_pending_silent()
 
     if state.get("notified_date") != today_str:
         state["notified_date"] = today_str
@@ -1682,9 +1724,10 @@ def run_iteration(state: dict) -> bool:
         stop_plan = evaluate_stop(ticker, pos, stock, state)
         if stop_plan:
             stop_plan["today"] = today
+            disp = _display_ticker(ticker, stock.get("name"))
             if _dispatch_full_exit(state, ticker, stop_plan,
                                    format_stop_message(stop_plan), "STOP"):
-                print(f"[{ts}] [СТОП] {ticker}: {stop_plan['price']:.2f} ≤ "
+                print(f"[{ts}] [СТОП] {disp}: {stop_plan['price']:.2f} ≤ "
                       f"{stop_plan['stop']:.2f}, продано "
                       f"{stop_plan['shares']} шт.")
             continue
@@ -1692,8 +1735,9 @@ def run_iteration(state: dict) -> bool:
         profit_plan = evaluate_profit(ticker, pos, stock, state)
         if profit_plan:
             profit_plan["today"] = today
+            disp = _display_ticker(ticker, stock.get("name"))
             if _dispatch_partial_exit(state, ticker, profit_plan):
-                print(f"[{ts}] [ФИКСАЦИЯ] {ticker}: "
+                print(f"[{ts}] [ФИКСАЦИЯ] {disp}: "
                       f"{profit_plan['trigger']}, "
                       f"{profit_plan['shares']} шт., "
                       f"чистая {profit_plan['net_profit']:.2f} ₽")
@@ -1703,9 +1747,10 @@ def run_iteration(state: dict) -> bool:
         time_plan = evaluate_time(ticker, pos, stock, state, today)
         if time_plan:
             time_plan["today"] = today
+            disp = _display_ticker(ticker, stock.get("name"))
             if _dispatch_full_exit(state, ticker, time_plan,
                                    format_time_message(time_plan), "TIME"):
-                print(f"[{ts}] [ГОРИЗОНТ] {ticker}: {time_plan['reason']}")
+                print(f"[{ts}] [ГОРИЗОНТ] {disp}: {time_plan['reason']}")
 
     save_state(state)
     return True
@@ -1801,7 +1846,8 @@ def run_reset_plan_cli(argv: List[str]) -> None:
         return
     state["positions"][ticker] = plan
     save_state(state)
-    print(f"[RESET] {ticker}: план пересчитан от {plan['plan_anchor']:.2f} ₽")
+    disp = _display_ticker(ticker, stock.get("name"))
+    print(f"[RESET] {disp}: план пересчитан от {plan['plan_anchor']:.2f} ₽")
     print(f"  Стоп: {plan['initial_stop']:.2f} ₽ | "
           f"Цели: {[round(x, 2) for x in plan['targets']]}")
     print(f"  R: {plan['risk_per_share']:.2f} ₽ | "
