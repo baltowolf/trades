@@ -12,21 +12,22 @@ This file guides agents working on this repository.
 
 ## Project
 
-Single-file sell-only MOEX tracker (`moex_tracker.py`, ~1200 lines). Python 3.14, sole external dependency: `requests`. Runs as a long-lived loop polling MOEX ISS every 600 s during MSK trading hours (10:00–23:50).
+Single-file sell-only MOEX tracker (`moex_tracker.py`, ~1900 lines). Python 3.14, sole external dependency: `requests`. Runs as a long-lived loop polling MOEX ISS every 600 s during MSK trading hours (10:00–23:50).
 
 Input `portfolio.json`:
 
 ```json
 {
-  "SBER": {"count": 14, "buy_price": 285.99, "target": 380.0},
+  "SBER": {"count": 14, "buy_price": 285.99},
   "LKOH": {"count": 1, "buy_price": 6065.5},
   "CASH": 10448
 }
 ```
 
-- `target` is optional. If absent, targets are ATR-based.
-- `stop` is optional. If absent, stop is 3 ATR capped at 18%.
-- If `target <= current price`, the plan immediately recommends selling the whole position.
+- `buy_price` is the entry price. The fixed grid and all stops are calculated from it.
+- `target` is optional and kept for backward compatibility; it no longer affects levels.
+- `stop` is optional. If absent or above entry, the initial stop is `-6%` from entry.
+- If the current price is already above the final +22% level, the plan sells the whole position.
 
 ## Commands
 
@@ -36,23 +37,21 @@ Input `portfolio.json`:
 - `python moex_tracker.py --send-pending` — retry unsent Telegram messages
 - `python moex_tracker.py --stats` — closed-trade statistics
 - `python moex_tracker.py --migrate` — backup and reset state to the sell-only format
-- `python moex_tracker.py --reset-plan TICKER` — recompute a plan from the current price
+- `python moex_tracker.py --reset-plan TICKER` — recompute a plan from the entry price
 - `python test_fixes.py` — regression and sanity tests
 
 `--screen` and `--ideas-check` are intentionally removed. `fundamentals.json` and `ideas.json` were removed from the project.
 
 ## Critical Patterns
 
-- **State schema v4.** `state.json` requires `schema_version: 4`. A different schema is rejected until `--migrate` is run.
+- **State schema v4.** `state.json` requires `schema_version: 4`. A different schema is rejected until `--migrate` is run. `PLAN_LOGIC_VERSION = 2` marks the fixed-percentage plan; old ATR plans are upgraded on sync without losing `sold`, `realized_pnl`, or `opened_at`.
 - **Atomic writes.** `atomic_write_json()` is the only writer for state and notifications.
 - **Portfolio loader is strict.** Missing/invalid `portfolio.json` returns an error; the iteration is skipped. Never treat a broken portfolio as empty.
-- **Plan anchor.** `plan_anchor` is the current price at plan inception. `avg_cost` is only for P&L, tax, and break-even. Never lower `stop_current`.
-- **Peak starts at plan inception.** `peak = max(plan_anchor, last)`. Do not seed it from a pre-plan historical high; that can push the stop above the current price and trigger a false liquidation.
-- **Initial stop.** `plan_anchor - min(3 ATR, 18% * plan_anchor)`, or the user-provided `stop`.
-- **ATR ladder without target.** TP1 = +2 ATR (40%), TP2 = +4 ATR (30%), TP3 = +6 ATR (all remainder).
-- **Target ladder.** TP1 = +2 ATR (40%), TP2 = +4 ATR (30%), final = target (remainder 30%). If target between TP1 and TP2: TP1 (50%), final = target (50%). The final stage always sells the whole remainder.
-- **Target at or below current price.** Sell the whole position immediately.
-- **Stop ratchet.** At Stage 0: initial stop holds without pre-TP1 tightening (no premature shakeouts). After TP1: break-even including commission and NDFL. After TP2: stop moves to TP1 level (`plan_anchor + 2 ATR`), and trailing chandelier (`peak - 3 ATR`) protects the free runner without dipping below TP1.
+- **Entry anchor.** `plan_anchor = avg_cost = buy_price` (the entry price). All grid levels and percentage stops are calculated from it. `avg_cost` is used for P&L, tax, and break-even. `target` is informational only.
+- **Fixed grid.** TP1 = `+7%` (sell 30%), TP2 = `+14%` (sell 30%), TP3 = `+22%` (sell the whole remainder, 40%). The final stage always sells the whole remainder. If the price gaps through several levels, sell the cumulative share of the reached levels; if already above TP3, sell everything.
+- **Peak.** `peak = max(entry, last)`, then only increases. The 5% trailing stop is used only after the +14% milestone, so seeding `peak` with the entry does not cause a false pre-TP1 liquidation.
+- **Initial stop.** `entry * (1 - 6%)`, or the user-provided `stop`. In the 5-6% range the wider 6% is used to absorb normal 3-5% blue-chip pullbacks.
+- **Stop ratchet.** Before the `+7%` milestone the stop stays at the initial `-6%` and is not tightened (old narrower stops are widened on upgrade). After `+7%`: `+0.5%` from entry (true breakeven after commission and NDFL). After `+14%`: `+8%` from entry and a 5% trailing stop from the peak, but never below `+8%`. Near `+22%` the trail is about `+16%`. After TP3 the position is closed. Once a milestone is reached, `stop_current` never decreases.
 - **Stop trigger price.** `min(last, bid)`; TP trigger price uses `bid` with `last` fallback.
 - **Pending partial sale.** After a partial TP recommendation, `pending_sell_shares` prevents an unchanged `portfolio.json` from being mistaken for a manual buy. Do not reinitialize the plan while the sale is pending.
 - **Time exit.** After 180 days from plan inception (medium term 3-6 months), recommend selling the whole position.

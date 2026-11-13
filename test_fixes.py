@@ -1,6 +1,5 @@
-"""Self-checks for moex_tracker v5 sell-only."""
+"""Self-checks for moex_tracker v6 sell-only (fixed % grid)."""
 import json
-import math
 import os
 import tempfile
 from datetime import datetime, timedelta
@@ -41,6 +40,10 @@ def _pos(count=100, buy=95.0, target=None, stop=None):
     }
 
 
+def _prices(values):
+    return [round(float(v), 6) for v in values]
+
+
 # ==============================================================================
 # 1. ИНДИКАТОРЫ
 # ==============================================================================
@@ -53,6 +56,17 @@ assert m._ema([1, 2, 3, 4, 5], 3) > 3.0
 
 candles = [[100.0, 100.0, 110.0, 90.0, 0.0, 0.0] for _ in range(20)]
 assert abs(m._atr(candles, 14) - 20.0) < 1e-9
+
+# ATR больше не участвует в планировании, но остаётся для дашборда.
+assert m.TP1_PCT == 7.0
+assert m.TP2_PCT == 14.0
+assert m.TP3_PCT == 22.0
+assert m.TP1_SELL_PCT == 0.30
+assert m.TP2_SELL_PCT == 0.30
+assert m.INITIAL_STOP_PCT == 6.0
+assert m.STOP_AFTER_TP1_PCT == 0.5
+assert m.STOP_AFTER_TP2_PCT == 8.0
+assert m.TRAILING_FROM_PEAK_PCT == 5.0
 
 # ==============================================================================
 # 2. ИЗДЕРЖКИ
@@ -90,55 +104,90 @@ with tempfile.TemporaryDirectory() as tmp:
     assert bad_err is not None
 
 # ==============================================================================
-# 4. УРОВНИ
+# 4. СЕТКА УРОВНЕЙ
 # ==============================================================================
 
-no_target = m._build_atr_levels(100.0, 5.0, 100, 1)
-assert no_target is not None and len(no_target) == 3
-assert [l["price"] for l in no_target] == [110.0, 120.0, 130.0]
-assert [l["cum_count"] for l in no_target] == [40, 70, 100]
-assert no_target[-1]["is_final"] is True
+levels = m._build_pct_levels(100.0, 100, 1)
+assert levels is not None and len(levels) == 3
+assert _prices([l["price"] for l in levels]) == [107.0, 114.0, 122.0]
+assert [l["cum_count"] for l in levels] == [30, 60, 100]
+assert levels[-1]["is_final"] is True
 
-small = m._build_atr_levels(100.0, 5.0, 1, 1)
-assert small is not None and len(small) == 1 and small[0]["is_final"]
+# Округление до лотов: 14 акций -> 4 / 4 / 6.
+levels14 = m._build_pct_levels(100.0, 14, 1)
+assert [l["cum_count"] for l in levels14] == [4, 8, 14]
 
-target3 = m._build_target_levels(100.0, 90.0, 140.0, 100, 1)
-assert target3 is not None and len(target3) == 3
-assert [l["price"] for l in target3] == [110.0, 120.0, 140.0]
-assert [l["cum_count"] for l in target3] == [40, 70, 100]
+# Одна акция: продать 30% нельзя — остаётся только финальная ступень.
+levels1 = m._build_pct_levels(100.0, 1, 1)
+assert len(levels1) == 1
+assert levels1[0]["name"] == "TP3"
+assert levels1[0]["price"] == 122.0
+assert levels1[0]["is_final"] is True
 
-target2 = m._build_target_levels(100.0, 90.0, 120.0, 100, 1)
-assert target2 is not None and len(target2) == 2
-assert [l["cum_count"] for l in target2] == [50, 100]
+# Две акции: TP1 пропускается, TP2 продаёт один лот.
+levels2 = m._build_pct_levels(100.0, 2, 1)
+assert [l["name"] for l in levels2] == ["TP2", "TP3"]
+assert [l["cum_count"] for l in levels2] == [1, 2]
 
-target1 = m._build_target_levels(100.0, 90.0, 105.0, 100, 1)
-assert target1 is not None and len(target1) == 1
-assert target1[0]["price"] == 105.0 and target1[0]["is_final"]
-
-target_below = m._build_target_levels(100.0, 90.0, 95.0, 100, 1)
-assert target_below is not None and len(target_below) == 1
-assert target_below[0]["price"] == 95.0
+# Лоты по 10: 100 акций -> 30 / 30 / 40.
+levels_lot = m._build_pct_levels(100.0, 100, 10)
+assert [l["cum_count"] for l in levels_lot] == [30, 60, 100]
 
 # ==============================================================================
 # 5. ПЛАНЫ
 # ==============================================================================
 
-plan_atr = m.build_position_plan("AAA", _pos(target=None), _stock(), TODAY)
-assert plan_atr is not None
-assert plan_atr["initial_stop"] == 85.0
-assert plan_atr["targets"] == [110.0, 120.0, 130.0]
-assert plan_atr["target"] is None
+plan = m.build_position_plan(
+    "AAA", _pos(count=100, buy=100.0), _stock(last=100.0), TODAY
+)
+assert plan is not None
+assert plan["plan_anchor"] == 100.0
+assert plan["avg_cost"] == 100.0
+assert plan["initial_stop"] == 94.0
+assert _prices(plan["targets"]) == [107.0, 114.0, 122.0]
+assert plan["risk_per_share"] == 6.0
+assert plan["initial_risk_rub"] == 600.0
+assert plan["logic_version"] == m.PLAN_LOGIC_VERSION
+assert plan["peak"] == 100.0
+assert plan["target"] is None
 
+# Цена уже выше входа — пик сразу учитывается, но сетка от входа.
+plan_above = m.build_position_plan(
+    "AAA", _pos(count=100, buy=100.0), _stock(last=120.0), TODAY
+)
+assert plan_above is not None
+assert plan_above["plan_anchor"] == 100.0
+assert _prices(plan_above["targets"]) == [107.0, 114.0, 122.0]
+assert plan_above["peak"] == 120.0
+
+# target больше не меняет сетку.
 plan_target = m.build_position_plan(
-    "AAA", _pos(target=140.0, stop=90.0), _stock(), TODAY
+    "AAA", _pos(count=100, buy=100.0, target=140.0), _stock(), TODAY
 )
 assert plan_target is not None
-assert plan_target["initial_stop"] == 90.0
-assert plan_target["targets"] == [110.0, 120.0, 140.0]
+assert _prices(plan_target["targets"]) == [107.0, 114.0, 122.0]
 assert plan_target["target"] == 140.0
 
+# Ручной стоп из portfolio.json важнее -6%.
+plan_stop = m.build_position_plan(
+    "AAA", _pos(count=100, buy=100.0, stop=95.0), _stock(), TODAY
+)
+assert plan_stop is not None and plan_stop["initial_stop"] == 95.0
+
+# Некорректный ручной стоп (выше входа) игнорируется.
+plan_bad_stop = m.build_position_plan(
+    "AAA", _pos(count=100, buy=100.0, stop=101.0), _stock(), TODAY
+)
+assert plan_bad_stop is not None and plan_bad_stop["initial_stop"] == 94.0
+
+# Для построения плана больше не нужен ATR.
+plan_no_atr = m.build_position_plan(
+    "AAA", _pos(count=100, buy=100.0), _stock(last=100.0, atr=0.0), TODAY
+)
+assert plan_no_atr is not None
+
 # ==============================================================================
-# 6. СТОП
+# 6. СТОПЫ
 # ==============================================================================
 
 pstate_stop = m.build_position_plan(
@@ -156,6 +205,8 @@ assert stop_plan["shares"] == 20, \
     f"Stop must be lot-aligned to 20, got {stop_plan['shares']}"
 assert stop_plan["lots"] == 2
 assert stop_plan["is_final"] is True
+assert "-6%" in stop_plan["reason"]
+assert abs(stop_plan["stop_pct"] + 6.0) < 1e-9
 
 pstate_stop["exit_alerted"] = True
 assert m.evaluate_stop(
@@ -165,79 +216,171 @@ assert m.evaluate_stop(
 ) is None
 pstate_stop["exit_alerted"] = False
 
-# Проверка поджима стопа:
-# На стадии 0 стоп НЕ поджимается при peak = anchor + 0.8R (дает свободу колебаниям)
-pstate_stop["stop_current"] = pstate_stop["initial_stop"]
-pstate_stop["peak"] = 108.0
+# До +7% стоп не поджимается: откат 3-5% — это шум.
+pstate_stop["stop_current"] = 94.0
+pstate_stop["peak"] = 105.0
 pstate_stop["stage"] = 0
+pstate_stop["sold"] = 0
 m.update_stops(state_stop, {"AAA": _stock(last=105.0, atr=5.0)})
-assert pstate_stop["stop_current"] == pstate_stop["initial_stop"], "На стадии 0 стоп не должен поджиматься до TP1"
+assert pstate_stop["stop_current"] == 94.0, \
+    "До TP1 стоп должен оставаться широким (-6%)"
 
-# На стадии 1 (после TP1) стоп переносится в безубыток
-pstate_stop["stage"] = 1
+# После +7% стоп переводится в безубыток +0.5%.
+pstate_stop["peak"] = 108.0
+pstate_stop["stop_current"] = 94.0
+m.update_stops(state_stop, {"AAA": _stock(last=108.0, atr=5.0)})
+assert abs(pstate_stop["stop_current"] - 100.5) < 1e-9, \
+    f"После TP1 ожидали 100.5, получили {pstate_stop['stop_current']}"
+
+# После +14% стоп не ниже +8%, плюс трейлинг 5% от пика.
+pstate_stop["peak"] = 115.0
+pstate_stop["stop_current"] = 100.5
 m.update_stops(state_stop, {"AAA": _stock(last=115.0, atr=5.0)})
-assert pstate_stop["stop_current"] >= 100.0, "На стадии 1 стоп должен быть не ниже безубытка"
+assert abs(pstate_stop["stop_current"] - 109.25) < 1e-9, \
+    f"После TP2 ожидали 109.25, получили {pstate_stop['stop_current']}"
 
-# На стадии 2 (после TP2) стоп переносится на TP1 и трейлит пик
-pstate_stop["stage"] = 2
-pstate_stop["peak"] = 130.0
-m.update_stops(state_stop, {"AAA": _stock(last=130.0, atr=5.0)})
-assert pstate_stop["stop_current"] >= 110.0, "На стадии 2 стоп должен быть не ниже уровня TP1"
-# Чендлер: 130 - 3*5 = 115.0 >= 110.0
-assert pstate_stop["stop_current"] >= 115.0, "На стадии 2 трейлинг Chandelier защищает остаток"
+# К +22% трейлинг 5% даёт примерно +16%.
+assert abs(m._pct_stop_floor(100.0, 122.0) - 115.9) < 1e-9
+
+# Уже заработанный стоп никогда не понижается.
+pstate_stop["stop_current"] = 120.0
+pstate_stop["peak"] = 108.0
+pstate_stop["sold"] = 5
+m.update_stops(state_stop, {"AAA": _stock(last=108.0, atr=5.0)})
+assert pstate_stop["stop_current"] == 120.0
+
+# На стадии 0 старый узкий стоп расширяется до -6%.
+pstate_stop["stop_current"] = 99.0
+pstate_stop["peak"] = 105.0
+pstate_stop["sold"] = 0
+m.update_stops(state_stop, {"AAA": _stock(last=105.0, atr=5.0)})
+assert pstate_stop["stop_current"] == 94.0
+
+# Пользовательский стоп в сообщении не выдаётся за -6%.
+pstate_stop["initial_stop"] = 95.0
+pstate_stop["stop_current"] = 95.0
+assert "portfolio.json" in m._stop_reason(pstate_stop, 95.0)
 
 # ==============================================================================
 # 7. ФИКСАЦИЯ ПРИБЫЛИ
 # ==============================================================================
 
 pstate_tp = m.build_position_plan(
-    "AAA", _pos(target=140.0, stop=90.0), _stock(), TODAY
+    "AAA", _pos(count=100, buy=100.0), _stock(), TODAY
 )
+assert pstate_tp is not None
 state_tp = {"positions": {"AAA": pstate_tp}}
 
+# Тейк считается по bid: если last выше уровня, а bid ниже — не продаём.
+assert m.evaluate_profit(
+    "AAA", {"count": 100, "buy_price": 100.0},
+    {"last": 107.1, "bid": 106.9, "lot_size": 1}, state_tp
+) is None
+
 tp1 = m.evaluate_profit(
-    "AAA", {"count": 100, "buy_price": 95.0},
-    {"last": 111.0, "bid": 111.0, "lot_size": 1}, state_tp
+    "AAA", {"count": 100, "buy_price": 100.0},
+    {"last": 107.1, "bid": 107.1, "lot_size": 1}, state_tp
 )
 assert tp1 is not None
-assert tp1["shares"] == 40 and tp1["level_name"] == "TP1"
-assert tp1["stop_after"] >= 100.0
+assert tp1["shares"] == 30 and tp1["level_name"] == "TP1"
+assert abs(tp1["stop_after"] - 100.5) < 1e-9
+assert abs(tp1["stop_after_pct"] - 0.5) < 1e-9
 
-pstate_tp["sold"] = 40
+pstate_tp["sold"] = 30
 pstate_tp["stage"] = 1
 tp2 = m.evaluate_profit(
-    "AAA", {"count": 60, "buy_price": 95.0},
-    {"last": 121.0, "bid": 121.0, "lot_size": 1}, state_tp
+    "AAA", {"count": 70, "buy_price": 100.0},
+    {"last": 114.1, "bid": 114.1, "lot_size": 1}, state_tp
 )
 assert tp2 is not None
 assert tp2["shares"] == 30 and tp2["level_name"] == "TP2"
-assert tp2["stop_after"] >= 110.0
+assert abs(tp2["stop_after"] - 114.1 * 0.95) < 1e-9
+assert tp2["stop_after"] >= 108.0
 
-pstate_tp["sold"] = 70
+pstate_tp["sold"] = 60
 pstate_tp["stage"] = 2
 tp3 = m.evaluate_profit(
-    "AAA", {"count": 30, "buy_price": 95.0},
-    {"last": 141.0, "bid": 141.0, "lot_size": 1}, state_tp
+    "AAA", {"count": 40, "buy_price": 100.0},
+    {"last": 122.1, "bid": 122.1, "lot_size": 1}, state_tp
 )
-assert tp3 is not None and tp3["is_final"] is True and tp3["shares"] == 30
+assert tp3 is not None and tp3["is_final"] is True and tp3["shares"] == 40
+assert tp3["stop_after"] is None
 
+# Гэп сразу к финальной цели закрывает всю позицию.
 pstate_tp["sold"] = 0
 pstate_tp["stage"] = 0
 gap = m.evaluate_profit(
-    "AAA", {"count": 100, "buy_price": 95.0},
-    {"last": 141.0, "bid": 141.0, "lot_size": 1}, state_tp
+    "AAA", {"count": 100, "buy_price": 100.0},
+    {"last": 125.0, "bid": 125.0, "lot_size": 1}, state_tp
 )
 assert gap is not None and gap["is_final"] is True and gap["shares"] == 100
 
-plan_target_below = m.build_position_plan(
-    "AAA", _pos(target=95.0, stop=90.0), _stock(), TODAY
+# Гэп к +15% догоняет обе первые ступени: продаём 60%.
+gap_mid = m.evaluate_profit(
+    "AAA", {"count": 100, "buy_price": 100.0},
+    {"last": 115.0, "bid": 115.0, "lot_size": 1}, state_tp
 )
-state_below = {"positions": {"AAA": plan_target_below}}
-below = m.evaluate_profit(
-    "AAA", {"count": 100, "buy_price": 95.0},
-    {"last": 96.0, "bid": 96.0, "lot_size": 1}, state_below
+assert gap_mid is not None
+assert gap_mid["level_name"] == "TP2"
+assert gap_mid["shares"] == 60
+assert abs(gap_mid["stop_after"] - 109.25) < 1e-9
+
+# target больше не влияет: при +25% продаётся всё, а не только до target.
+pstate_target_tp = m.build_position_plan(
+    "AAA", _pos(count=100, buy=100.0, target=140.0), _stock(), TODAY
 )
-assert below is not None and below["is_final"] is True
+state_target_tp = {"positions": {"AAA": pstate_target_tp}}
+above_target = m.evaluate_profit(
+    "AAA", {"count": 100, "buy_price": 100.0},
+    {"last": 125.0, "bid": 125.0, "lot_size": 1}, state_target_tp
+)
+assert above_target is not None and above_target["is_final"] is True
+assert above_target["shares"] == 100
+
+# Округление 14 акций: 4 / 4 / 6.
+pstate14 = m.build_position_plan(
+    "AAA", _pos(count=14, buy=100.0), _stock(), TODAY
+)
+state14 = {"positions": {"AAA": pstate14}}
+tp1_14 = m.evaluate_profit(
+    "AAA", {"count": 14, "buy_price": 100.0},
+    {"last": 107.1, "bid": 107.1, "lot_size": 1}, state14
+)
+assert tp1_14 is not None and tp1_14["shares"] == 4
+pstate14["sold"] = 4
+pstate14["stage"] = 1
+tp2_14 = m.evaluate_profit(
+    "AAA", {"count": 10, "buy_price": 100.0},
+    {"last": 114.1, "bid": 114.1, "lot_size": 1}, state14
+)
+assert tp2_14 is not None and tp2_14["shares"] == 4
+pstate14["sold"] = 8
+pstate14["stage"] = 2
+tp3_14 = m.evaluate_profit(
+    "AAA", {"count": 6, "buy_price": 100.0},
+    {"last": 122.1, "bid": 122.1, "lot_size": 1}, state14
+)
+assert tp3_14 is not None and tp3_14["is_final"] is True
+assert tp3_14["shares"] == 6
+
+# Одна акция: промежуточных продаж нет, но стоп всё равно подтягивается.
+pstate1 = m.build_position_plan(
+    "AAA", _pos(count=1, buy=100.0), _stock(), TODAY
+)
+state1 = {"positions": {"AAA": pstate1}}
+assert m.evaluate_profit(
+    "AAA", {"count": 1, "buy_price": 100.0},
+    {"last": 107.1, "bid": 107.1, "lot_size": 1}, state1
+) is None
+pstate1["peak"] = 107.1
+m.update_stops(state1, {"AAA": _stock(last=107.1)})
+assert abs(pstate1["stop_current"] - 100.5) < 1e-9
+tp3_1 = m.evaluate_profit(
+    "AAA", {"count": 1, "buy_price": 100.0},
+    {"last": 122.1, "bid": 122.1, "lot_size": 1}, state1
+)
+assert tp3_1 is not None and tp3_1["is_final"] is True
+assert tp3_1["shares"] == 1
 
 # ==============================================================================
 # 8. TIME EXIT
@@ -270,12 +413,15 @@ assert m.evaluate_time(
 # ==============================================================================
 
 state_sync = m.default_state()
-portfolio_sync = {"AAA": _pos(target=None)}
+portfolio_sync = {"AAA": _pos(buy=100.0, target=None)}
 tracked_sync = {"AAA": _stock()}
 changes = m.sync_state_with_portfolio(
     state_sync, portfolio_sync, tracked_sync, TODAY
 )
 assert "AAA" in state_sync["positions"] and changes
+assert state_sync["positions"]["AAA"]["plan_anchor"] == 100.0
+assert _prices(state_sync["positions"]["AAA"]["targets"]) == [107.0, 114.0, 122.0]
+assert state_sync["positions"]["AAA"]["logic_version"] == m.PLAN_LOGIC_VERSION
 
 portfolio_sync["AAA"]["count"] = 60
 m.sync_state_with_portfolio(state_sync, portfolio_sync, tracked_sync, TODAY)
@@ -289,7 +435,7 @@ assert state_sync["positions"]["AAA"]["sold"] == 0
 
 # Неисполненная частичная продажа не должна выглядеть как докупка.
 state_pending = m.default_state()
-portfolio_pending = {"AAA": _pos(target=None)}
+portfolio_pending = {"AAA": _pos(buy=100.0, target=None)}
 m.sync_state_with_portfolio(
     state_pending, portfolio_pending, tracked_sync, TODAY
 )
@@ -310,9 +456,9 @@ m.sync_state_with_portfolio(
 assert state_pending["positions"]["AAA"]["pending_sell_shares"] == 0
 assert state_pending["positions"]["AAA"]["sold"] == 40
 
-# Изменение target пересчитывает уровни.
+# target обновляется справочно, но сетка остаётся фиксированной.
 state_target = m.default_state()
-portfolio_target = {"AAA": _pos(target=None)}
+portfolio_target = {"AAA": _pos(buy=100.0, target=None)}
 m.sync_state_with_portfolio(
     state_target, portfolio_target, tracked_sync, TODAY
 )
@@ -321,7 +467,80 @@ m.sync_state_with_portfolio(
     state_target, portfolio_target, tracked_sync, TODAY
 )
 assert state_target["positions"]["AAA"]["target"] == 140.0
-assert 140.0 in state_target["positions"]["AAA"]["targets"]
+assert _prices(state_target["positions"]["AAA"]["targets"]) == [107.0, 114.0, 122.0]
+
+
+def _old_atr_plan(**overrides):
+    data = {
+        "avg_cost": 100.0,
+        "plan_anchor": 95.0,
+        "entry_atr": 5.0,
+        "current_atr": 5.0,
+        "initial_stop": 85.0,
+        "stop_current": 85.0,
+        "risk_per_share": 10.0,
+        "initial_risk_rub": 500.0,
+        "levels": [
+            {"name": "TP1", "price": 105.0, "cum_pct": 0.4,
+             "cum_count": 20, "is_final": False},
+            {"name": "TP2", "price": 115.0, "cum_pct": 0.7,
+             "cum_count": 35, "is_final": False},
+            {"name": "TP3", "price": 130.0, "cum_pct": 1.0,
+             "cum_count": 50, "is_final": True},
+        ],
+        "targets": [105.0, 115.0, 130.0],
+        "target": None,
+        "stage": 0,
+        "sold": 0,
+        "original_count": 50,
+        "peak": 96.0,
+        "opened_at": TODAY.isoformat(),
+        "exit_alerted": False,
+        "archived": False,
+        "pending_sell_shares": 0,
+        "realized_pnl": 0.0,
+        "realized_r": 0.0,
+        "closed_at": None,
+    }
+    data.update(overrides)
+    return data
+
+
+# Старый ATR-план без прогресса переводится на -6% и новую сетку.
+state_old = m.default_state()
+state_old["positions"]["AAA"] = _old_atr_plan()
+m.sync_state_with_portfolio(
+    state_old, {"AAA": _pos(count=50, buy=100.0)}, tracked_sync, TODAY
+)
+old = state_old["positions"]["AAA"]
+assert old["logic_version"] == m.PLAN_LOGIC_VERSION
+assert old["plan_anchor"] == 100.0
+assert _prices(old["targets"]) == [107.0, 114.0, 122.0]
+assert old["initial_stop"] == 94.0
+assert old["stop_current"] == 94.0
+
+# Старый план с уже зафиксированной прибылью не понижает стоп.
+state_old2 = m.default_state()
+state_old2["positions"]["AAA"] = _old_atr_plan(
+    sold=20, stage=1, peak=108.0, stop_current=99.0
+)
+m.sync_state_with_portfolio(
+    state_old2, {"AAA": _pos(count=30, buy=100.0)}, tracked_sync, TODAY
+)
+old2 = state_old2["positions"]["AAA"]
+assert old2["logic_version"] == m.PLAN_LOGIC_VERSION
+assert old2["stage"] == 1
+assert abs(old2["stop_current"] - 100.5) < 1e-9
+
+# Даже при откате пика старый высокий стоп сохраняется.
+state_old3 = m.default_state()
+state_old3["positions"]["AAA"] = _old_atr_plan(
+    sold=20, stage=1, peak=108.0, stop_current=120.0
+)
+m.sync_state_with_portfolio(
+    state_old3, {"AAA": _pos(count=30, buy=100.0)}, tracked_sync, TODAY
+)
+assert state_old3["positions"]["AAA"]["stop_current"] == 120.0
 
 # ==============================================================================
 # 10. TRADE LOG
@@ -383,21 +602,32 @@ assert m._display_ticker("SBER", None) == "SBER"
 assert m._display_ticker("SBER", "") == "SBER"
 
 stop_msg = m.format_stop_message({
-    "ticker": "PRMD", "name": "Промомед", "price": 400.0, "stop": 400.0,
-    "reason": "Chandelier Exit", "avg_cost": 420.0, "gain_pct": -4.76,
-    "shares": 6, "lots": 6, "net_profit": -120.0, "lot_warning": False,
+    "ticker": "PRMD", "name": "Промомед", "price": 400.0, "stop": 396.16,
+    "stop_pct": -6.0, "reason": "начальный стоп -6%", "avg_cost": 421.45,
+    "gain_pct": -5.09, "shares": 6, "lots": 6, "net_profit": -120.0,
+    "lot_warning": False,
 })
 assert "PRMD (Промомед)" in stop_msg
+assert "-6.0% от входа" in stop_msg
 
 profit_msg = m.format_profit_message({
     "ticker": "PRMD", "name": "Промомед", "level_name": "TP1",
-    "price": 434.0, "target_price": 434.0, "avg_cost": 421.0,
-    "gain_pct": 3.09, "shares": 6, "lots": 6, "sell_ratio": 35.3,
-    "gross": 2604.0, "commission": 5.0, "tax": 10.0,
-    "net_profit": 63.0, "is_final": False, "remaining_after": 11,
-    "stop_after": 422.0, "lot_warning": False,
+    "price": 451.0, "target_price": 451.0, "avg_cost": 421.45,
+    "gain_pct": 7.01, "shares": 5, "lots": 5, "sell_ratio": 29.4,
+    "gross": 2255.0, "commission": 5.0, "tax": 10.0,
+    "net_profit": 63.0, "is_final": False, "remaining_after": 12,
+    "stop_after": 423.56, "stop_after_pct": 0.5, "lot_warning": False,
 })
 assert "PRMD (Промомед)" in profit_msg
+assert "+0.5% от входа" in profit_msg
+
+# Старый формат без процентных полей тоже не должен падать.
+stop_msg_old = m.format_stop_message({
+    "ticker": "AAA", "price": 90.0, "stop": 94.0, "reason": "стоп",
+    "avg_cost": 100.0, "gain_pct": -10.0, "shares": 1, "lots": 1,
+    "net_profit": -10.0, "lot_warning": False,
+})
+assert "AAA" in stop_msg_old
 
 time_msg = m.format_time_message({
     "ticker": "PRMD", "name": "Промомед", "reason": "истёк горизонт",
@@ -460,6 +690,13 @@ with tempfile.TemporaryDirectory() as tmp:
 
 with open("moex_tracker.py", "r", encoding="utf-8") as f:
     source = f.read()
+assert "_build_atr_levels" not in source
+assert "_build_target_levels" not in source
+assert "ATR_TP_MULTS" not in source
+assert "INITIAL_STOP_ATR" not in source
+assert "TRAILING_ATR_MULT" not in source
+assert "_build_pct_levels" in source
+assert "PLAN_LOGIC_VERSION" in source
 assert "build_screen_map" not in source
 assert "load_fundamentals" not in source
 assert "IDEAS_FILE" not in source
@@ -467,4 +704,4 @@ assert "FUNDAMENTALS_FILE" not in source
 assert "core_count" not in source.lower()
 assert "buffett" not in source.lower()
 
-print("All sell-only v5 tests passed cleanly.")
+print("All sell-only v6 tests passed cleanly.")
