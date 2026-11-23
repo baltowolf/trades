@@ -1125,6 +1125,13 @@ def evaluate_stop(ticker: str, pos: dict, stock: dict,
     stop = float(pstate.get("stop_current", 0.0) or 0.0)
     if stop <= 0:
         return None
+
+    # ponytail: начальный стоп отключён для удержания до плюса; вернуть триггер если потребуется жёсткий риск-стоп.
+    initial = float(pstate.get("initial_stop", 0.0) or 0.0)
+    entry = float(pstate.get("plan_anchor", 0.0) or pstate.get("avg_cost", 0.0) or 0.0)
+    if (initial > 0 and stop <= initial + 1e-6) or (entry > 0 and stop <= entry):
+        return None
+
     price = _executable_sell_price(stock)
     if price > stop:
         return None

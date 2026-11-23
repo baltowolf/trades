@@ -195,26 +195,13 @@ pstate_stop = m.build_position_plan(
 )
 assert pstate_stop is not None
 state_stop = {"positions": {"AAA": pstate_stop}}
-stop_plan = m.evaluate_stop(
-    "AAA", {"count": 25, "buy_price": 100.0},
-    {"last": 80.0, "bid": 79.0, "lot_size": 10, "atr": 5.0},
-    state_stop,
-)
-assert stop_plan is not None
-assert stop_plan["shares"] == 20, \
-    f"Stop must be lot-aligned to 20, got {stop_plan['shares']}"
-assert stop_plan["lots"] == 2
-assert stop_plan["is_final"] is True
-assert "-6%" in stop_plan["reason"]
-assert abs(stop_plan["stop_pct"] + 6.0) < 1e-9
 
-pstate_stop["exit_alerted"] = True
+# Начальный стоп (-6%) не триггерит выход: позицию держим до плюса.
 assert m.evaluate_stop(
     "AAA", {"count": 25, "buy_price": 100.0},
     {"last": 80.0, "bid": 79.0, "lot_size": 10, "atr": 5.0},
     state_stop,
 ) is None
-pstate_stop["exit_alerted"] = False
 
 # До +7% стоп не поджимается: откат 3-5% — это шум.
 pstate_stop["stop_current"] = 94.0
@@ -232,12 +219,44 @@ m.update_stops(state_stop, {"AAA": _stock(last=108.0, atr=5.0)})
 assert abs(pstate_stop["stop_current"] - 100.5) < 1e-9, \
     f"После TP1 ожидали 100.5, получили {pstate_stop['stop_current']}"
 
+# Стоп по лесенке (безубыток +0.5%) срабатывает штатно.
+stop_plan = m.evaluate_stop(
+    "AAA", {"count": 25, "buy_price": 100.0},
+    {"last": 99.0, "bid": 98.0, "lot_size": 10, "atr": 5.0},
+    state_stop,
+)
+assert stop_plan is not None
+assert stop_plan["shares"] == 20, \
+    f"Stop must be lot-aligned to 20, got {stop_plan['shares']}"
+assert stop_plan["lots"] == 2
+assert stop_plan["is_final"] is True
+assert "безубыток" in stop_plan["reason"]
+assert abs(stop_plan["stop"] - 100.5) < 1e-9
+
+pstate_stop["exit_alerted"] = True
+assert m.evaluate_stop(
+    "AAA", {"count": 25, "buy_price": 100.0},
+    {"last": 99.0, "bid": 98.0, "lot_size": 10, "atr": 5.0},
+    state_stop,
+) is None
+pstate_stop["exit_alerted"] = False
+
 # После +14% стоп не ниже +8%, плюс трейлинг 5% от пика.
 pstate_stop["peak"] = 115.0
 pstate_stop["stop_current"] = 100.5
 m.update_stops(state_stop, {"AAA": _stock(last=115.0, atr=5.0)})
 assert abs(pstate_stop["stop_current"] - 109.25) < 1e-9, \
     f"После TP2 ожидали 109.25, получили {pstate_stop['stop_current']}"
+
+# Трейлинг-стоп срабатывает при откате ниже 109.25.
+trail_plan = m.evaluate_stop(
+    "AAA", {"count": 25, "buy_price": 100.0},
+    {"last": 109.0, "bid": 108.5, "lot_size": 10, "atr": 5.0},
+    state_stop,
+)
+assert trail_plan is not None
+assert "трейлинг-стоп" in trail_plan["reason"]
+assert trail_plan["shares"] == 20
 
 # К +22% трейлинг 5% даёт примерно +16%.
 assert abs(m._pct_stop_floor(100.0, 122.0) - 115.9) < 1e-9
