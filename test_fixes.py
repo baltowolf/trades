@@ -723,4 +723,17 @@ assert "FUNDAMENTALS_FILE" not in source
 assert "core_count" not in source.lower()
 assert "buffett" not in source.lower()
 
+# ==============================================================================
+# 15. СЕССИЯ MOEX ISS И СИСТЕМНЫЕ СЕРТИФИКАТЫ
+# ==============================================================================
+
+session = m.create_moex_session()
+assert session is not None
+adapter = session.adapters.get("https://")
+assert adapter is not None
+assert hasattr(adapter, "poolmanager")
+ssl_ctx = adapter.poolmanager.connection_pool_kw.get("ssl_context")
+assert ssl_ctx is not None
+assert ssl_ctx.check_hostname is True
+
 print("All sell-only v6 tests passed cleanly.")

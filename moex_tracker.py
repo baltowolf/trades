@@ -47,6 +47,7 @@ import json
 import math
 import os
 import shutil
+import ssl
 import statistics
 import sys
 import time
@@ -475,6 +476,12 @@ def create_moex_session() -> requests.Session:
         raise_on_status=False,
     )
     adapter = HTTPAdapter(max_retries=retry, pool_connections=25, pool_maxsize=25)
+    try:
+        ctx = ssl.create_default_context()
+        ctx.load_default_certs()
+        adapter.init_poolmanager(25, 25, ssl_context=ctx)
+    except Exception:
+        pass
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     session.headers.update({
