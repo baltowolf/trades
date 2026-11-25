@@ -12,8 +12,8 @@
     "buy_price": 285.99
   },
   "YDEX": {
-    "count": 6,
-    "buy_price": 3564.3
+    "count": 7,
+    "buy_price": 3505
   },
   "TATN": {
     "count": 33,
@@ -30,10 +30,6 @@
   "T": {
     "count": 4,
     "buy_price": 270.59
-  },
-  "GMKN": {
-    "count": 30,
-    "buy_price": 115.24
   },
   "IRAO": {
     "count": 3000,
